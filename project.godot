@@ -12,5 +12,9 @@ config_version=5
 
 config/name="DavidMaps"
 run/main_scene="uid://bkq1inxbci5u"
-config/features=PackedStringArray("4.4", "Forward Plus")
+config/features=PackedStringArray("4.5", "Forward Plus")
 config/icon="res://icon.svg"
+
+[dotnet]
+
+project/assembly_name="DavidMaps"
