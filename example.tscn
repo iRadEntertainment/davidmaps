@@ -1,4 +1,6 @@
-[gd_scene format=3 uid="uid://bkq1inxbci5u"]
+[gd_scene load_steps=2 format=3 uid="uid://bkq1inxbci5u"]
+
+[ext_resource type="Script" uid="uid://dbfed6elyysgg" path="res://addons/DavidMaps/DavidMaps.gd" id="1_2jas5"]
 
 [node name="example" type="PanelContainer"]
 anchors_preset = 15
@@ -12,3 +14,8 @@ layout_mode = 2
 
 [node name="PanelContainer" type="PanelContainer" parent="HSplitContainer"]
 layout_mode = 2
+
+[node name="DavidMaps" type="PanelContainer" parent="HSplitContainer"]
+layout_mode = 2
+script = ExtResource("1_2jas5")
+metadata/_custom_type_script = "uid://dbfed6elyysgg"

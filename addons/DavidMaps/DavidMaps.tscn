@@ -9,9 +9,3 @@ anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("1_ur6n7")
-
-[node name="modules" type="Node" parent="."]
-
-[node name="Provider" type="Node" parent="modules"]
-
-[node name="HTTPthingy" type="Node" parent="modules"]
