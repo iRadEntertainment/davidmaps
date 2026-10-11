@@ -11,59 +11,104 @@ grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("1_n51mc")
 
-[node name="HSplitContainer" type="HSplitContainer" parent="." unique_id=1510104323]
+[node name="split" type="HSplitContainer" parent="." unique_id=1510104323]
 layout_mode = 2
 
-[node name="PanelContainer" type="PanelContainer" parent="HSplitContainer" unique_id=618806796]
+[node name="pnl_tools" type="PanelContainer" parent="split" unique_id=618806796]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_stretch_ratio = 0.25
 
-[node name="scroll" type="ScrollContainer" parent="HSplitContainer/PanelContainer" unique_id=464837267]
+[node name="scroll" type="ScrollContainer" parent="split/pnl_tools" unique_id=464837267]
 layout_mode = 2
 horizontal_scroll_mode = 0
 
-[node name="vb" type="VBoxContainer" parent="HSplitContainer/PanelContainer/scroll" unique_id=549347117]
+[node name="vb" type="VBoxContainer" parent="split/pnl_tools/scroll" unique_id=549347117]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 
-[node name="lb_title" type="Label" parent="HSplitContainer/PanelContainer/scroll/vb" unique_id=1143106256]
+[node name="lb_title" type="Label" parent="split/pnl_tools/scroll/vb" unique_id=1143106256]
 layout_mode = 2
-text = "David Maps"
+text = "iRadMaps"
+horizontal_alignment = 1
 
-[node name="fld_mouse" type="FoldableContainer" parent="HSplitContainer/PanelContainer/scroll/vb" unique_id=1680460783]
+[node name="fld_settings" type="FoldableContainer" parent="split/pnl_tools/scroll/vb" unique_id=839751355]
+layout_mode = 2
+title = "Settings"
+
+[node name="vb" type="VBoxContainer" parent="split/pnl_tools/scroll/vb/fld_settings" unique_id=1947528914]
+layout_mode = 2
+
+[node name="opt_provider" type="OptionButton" parent="split/pnl_tools/scroll/vb/fld_settings/vb" unique_id=1762491093]
+unique_name_in_owner = true
+layout_mode = 2
+
+[node name="opt_layer" type="OptionButton" parent="split/pnl_tools/scroll/vb/fld_settings/vb" unique_id=38104093]
+unique_name_in_owner = true
+layout_mode = 2
+
+[node name="lb" type="Label" parent="split/pnl_tools/scroll/vb/fld_settings/vb" unique_id=1907026682]
+layout_mode = 2
+text = "view scale"
+
+[node name="hb_view_scale" type="HBoxContainer" parent="split/pnl_tools/scroll/vb/fld_settings/vb" unique_id=1897489763]
+layout_mode = 2
+
+[node name="sl_view_scale" type="HSlider" parent="split/pnl_tools/scroll/vb/fld_settings/vb/hb_view_scale" unique_id=1326415933]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 4
+min_value = 0.25
+max_value = 2.5
+step = 0.05
+value = 1.0
+
+[node name="lb_view_scale" type="Label" parent="split/pnl_tools/scroll/vb/fld_settings/vb/hb_view_scale" unique_id=2069141530]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(42, 0)
+layout_mode = 2
+text = "1.00"
+horizontal_alignment = 2
+
+[node name="ck_debug" type="CheckButton" parent="split/pnl_tools/scroll/vb/fld_settings/vb" unique_id=81188779]
+unique_name_in_owner = true
+layout_mode = 2
+text = "debug"
+
+[node name="fld_mouse" type="FoldableContainer" parent="split/pnl_tools/scroll/vb" unique_id=1680460783]
 layout_mode = 2
 title = "Mouse"
 
-[node name="vb" type="VBoxContainer" parent="HSplitContainer/PanelContainer/scroll/vb/fld_mouse" unique_id=1251073260]
+[node name="vb" type="VBoxContainer" parent="split/pnl_tools/scroll/vb/fld_mouse" unique_id=1251073260]
 layout_mode = 2
 
-[node name="mouse_lat_log_pos" type="Label" parent="HSplitContainer/PanelContainer/scroll/vb/fld_mouse/vb" unique_id=1017969588]
+[node name="mouse_lat_log_pos" type="Label" parent="split/pnl_tools/scroll/vb/fld_mouse/vb" unique_id=1017969588]
 unique_name_in_owner = true
 layout_mode = 2
-text = "Lat:
-Lon:"
 
-[node name="fld_map" type="FoldableContainer" parent="HSplitContainer/PanelContainer/scroll/vb" unique_id=1786147250]
+[node name="fld_map" type="FoldableContainer" parent="split/pnl_tools/scroll/vb" unique_id=1786147250]
 layout_mode = 2
 title = "Map"
 
-[node name="vb" type="VBoxContainer" parent="HSplitContainer/PanelContainer/scroll/vb/fld_map" unique_id=742663542]
+[node name="vb" type="VBoxContainer" parent="split/pnl_tools/scroll/vb/fld_map" unique_id=742663542]
 layout_mode = 2
 
-[node name="map_info" type="Label" parent="HSplitContainer/PanelContainer/scroll/vb/fld_map/vb" unique_id=1420602055]
+[node name="map_info" type="Label" parent="split/pnl_tools/scroll/vb/fld_map/vb" unique_id=1420602055]
 unique_name_in_owner = true
 layout_mode = 2
-text = "Info"
 
-[node name="DavidMaps" type="PanelContainer" parent="HSplitContainer" unique_id=1420971938]
+[node name="DavidMaps" type="PanelContainer" parent="split" unique_id=1420971938]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 script = ExtResource("1_2jas5")
+provider_type = 10
+visualization_scale = 1.7
+map_layer = 9
 max_cached_tiles = 300
 metadata/_custom_type_script = "uid://dbfed6elyysgg"
 
-[connection signal="map_mouse_event" from="HSplitContainer/DavidMaps" to="." method="_on_david_maps_map_mouse_event"]
-[connection signal="view_changed" from="HSplitContainer/DavidMaps" to="." method="_on_david_maps_view_changed"]
+[connection signal="map_mouse_event" from="split/DavidMaps" to="." method="_on_david_maps_map_mouse_event"]
+[connection signal="view_changed" from="split/DavidMaps" to="." method="_on_david_maps_view_changed"]
