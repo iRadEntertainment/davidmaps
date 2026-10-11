@@ -97,6 +97,9 @@ var _overlay_tile_zooms: Dictionary[MapOverlay, int] = {}
 var _previous_rendered_tiles: Dictionary[Vector3i, Tile] = {}
 var _debug_mouse_position: Vector2
 var _debug_mouse_inside: bool = false
+var _request_focus_position: Vector2
+var _request_focus_inside: bool = false
+var _request_reprioritization_scheduled: bool = false
 var _navigation_tween: Tween
 var _is_dragging: bool = false
 
@@ -430,10 +433,18 @@ func _gui_input(event: InputEvent) -> void:
 			cont_debug_renderer.get_global_transform_with_canvas().affine_inverse()
 			* event_canvas_position
 		)
+		_request_focus_position = (
+			cont_tile_renderer.get_global_transform_with_canvas().affine_inverse()
+			* event_canvas_position
+		)
 		_debug_mouse_inside = Rect2(Vector2.ZERO, cont_debug_renderer.size).has_point(
 			_debug_mouse_position
 		)
+		_request_focus_inside = Rect2(Vector2.ZERO, cont_tile_renderer.size).has_point(
+			_request_focus_position
+		)
 		cont_debug_renderer.queue_redraw()
+		_schedule_request_reprioritization()
 
 		if _is_dragging and interaction_enabled and pan_enabled:
 			_cancel_navigation()
@@ -588,7 +599,9 @@ func _draw_debug_renderer() -> void:
 
 func _on_mouse_exited() -> void:
 	_debug_mouse_inside = false
+	_request_focus_inside = false
 	cont_debug_renderer.queue_redraw()
+	_schedule_request_reprioritization()
 
 
 func _draw_tile_layer(
@@ -740,6 +753,7 @@ func _request_visible_tiles() -> void:
 	_visible_tiles.clear()
 	_visible_overlay_tiles.clear()
 	_overlay_tile_zooms.clear()
+	var candidates: Array[TileLoadCandidate] = []
 
 	var tile_zoom := _get_tile_zoom_level()
 	_track_rendered_tile_zoom(tile_zoom)
@@ -756,9 +770,11 @@ func _request_visible_tiles() -> void:
 			var tile_index := Vector3i(tile_zoom, x_wr, y_un)
 			if _visible_tiles.has(tile_index):
 				continue
-			_visible_tiles[tile_index] = _get_or_request_tile(
-				_provider.source, tile_index, _provider.url_from_index(tile_index)
-			)
+			var tile := _get_or_create_tile(_provider.source, tile_index)
+			_visible_tiles[tile_index] = tile
+			candidates.append(TileLoadCandidate.new(
+				tile, _provider.url_from_index(tile_index), 0
+			))
 
 	# Overlays use independent zoom limits; high-zoom maps can upscale their
 	# last native level, and low-zoom maps skip unsupported overlay levels.
@@ -782,23 +798,99 @@ func _request_visible_tiles() -> void:
 				var tile_index := Vector3i(overlay_zoom, posmod(x_un, overlay_n), y_un)
 				if overlay_tiles.has(tile_index):
 					continue
-				overlay_tiles[tile_index] = _get_or_request_tile(
-					overlay_source.source, tile_index, overlay_source.url_from_index(tile_index)
-				)
+				var tile := _get_or_create_tile(overlay_source.source, tile_index)
+				overlay_tiles[tile_index] = tile
+				candidates.append(TileLoadCandidate.new(
+					tile,
+					overlay_source.url_from_index(tile_index),
+					1 + int(overlay),
+				))
 
 	_cancel_obsolete_tile_requests()
+	_queue_tile_candidates(candidates)
 	_trim_tile_cache()
 
 
-func _get_or_request_tile(source: TileSourceDefinition, index: Vector3i, url: String) -> Tile:
+func _get_or_create_tile(source: TileSourceDefinition, index: Vector3i) -> Tile:
 	var definition := TileDefinition.new(source, index)
 	var tile := _tile_cache.get_tile(definition)
 	if tile == null:
 		tile = Tile.new(definition)
 		tile.image_updated.connect(_on_tile_image_updated)
 		_tile_cache.store_tile(tile)
-	tile.request_image(tile_loader, url)
 	return tile
+
+
+func _queue_tile_candidates(candidates: Array[TileLoadCandidate]) -> void:
+	for candidate in candidates:
+		var distance_priority := _get_tile_distance_priority(candidate.tile.index)
+		candidate.tile.request_image(
+			tile_loader,
+			candidate.url,
+			int(distance_priority.x),
+			candidate.layer_priority,
+			distance_priority.y,
+		)
+
+
+# Returns (distance ring, exact squared screen-space distance). The world copy
+# nearest to the focus is used so prioritization remains correct at the dateline.
+func _get_tile_distance_priority(tile_index: Vector3i) -> Vector2:
+	var tile_zoom := tile_index.x
+	var display_tile_size := _get_display_tile_size(tile_zoom)
+	var renderer_size := cont_tile_renderer.size
+	var focus := (
+		_request_focus_position if _request_focus_inside else renderer_size / 2.0
+	)
+	var focus_tile := _screen_to_tilef(focus, tile_zoom, display_tile_size)
+	var center_tile := _coord_to_tilef(map_center_coord, tile_zoom)
+	var world_tile_count := 1 << tile_zoom
+	var unwrapped_x := float(tile_index.y) + roundf(
+		(focus_tile.x - float(tile_index.y)) / float(world_tile_count)
+	) * float(world_tile_count)
+	var top_left := renderer_size / 2.0 + Vector2(
+		(unwrapped_x - center_tile.x) * display_tile_size.x,
+		(float(tile_index.z) - center_tile.y) * display_tile_size.y,
+	)
+	var tile_rect := Rect2(top_left, display_tile_size)
+	var nearest_point := Vector2(
+		clampf(focus.x, tile_rect.position.x, tile_rect.end.x),
+		clampf(focus.y, tile_rect.position.y, tile_rect.end.y),
+	)
+	var distance_squared := focus.distance_squared_to(nearest_point)
+	var ring := 0
+	if not tile_rect.has_point(focus):
+		var tile_extent := maxf(1.0, minf(display_tile_size.x, display_tile_size.y))
+		ring = floori(sqrt(distance_squared) / tile_extent) + 1
+	return Vector2(ring, distance_squared)
+
+
+func _schedule_request_reprioritization() -> void:
+	if _request_reprioritization_scheduled or not is_inside_tree():
+		return
+	_request_reprioritization_scheduled = true
+	call_deferred("_reprioritize_visible_requests")
+
+
+func _reprioritize_visible_requests() -> void:
+	_request_reprioritization_scheduled = false
+	if _provider == null or tile_loader == null or tile_loader.get_queued_request_count() == 0:
+		return
+	for tile in _visible_tiles.values():
+		_update_tile_request_priority(tile, 0)
+	for overlay in _visible_overlay_tiles:
+		for tile in _visible_overlay_tiles[overlay].values():
+			_update_tile_request_priority(tile, 1 + int(overlay))
+
+
+func _update_tile_request_priority(tile: Tile, layer_priority: int) -> void:
+	var distance_priority := _get_tile_distance_priority(tile.index)
+	tile.update_image_request_priority(
+		tile_loader,
+		int(distance_priority.x),
+		layer_priority,
+		distance_priority.y,
+	)
 
 
 func _get_protected_tiles() -> Dictionary:
@@ -938,6 +1030,17 @@ class TileDefinition extends RefCounted:
 	func _init(_source: TileSourceDefinition, _index: Vector3i) -> void:
 		source = _source
 		index = _index
+
+
+class TileLoadCandidate extends RefCounted:
+	var tile: Tile
+	var url: String
+	var layer_priority: int
+
+	func _init(_tile: Tile, _url: String, _layer_priority: int) -> void:
+		tile = _tile
+		url = _url
+		layer_priority = _layer_priority
 
 
 # Raster basemap. See the suppliers' tile policies before distributing an app.
@@ -1115,11 +1218,26 @@ class TileRequest extends RefCounted:
 	var url: String
 	var custom_headers: PackedStringArray
 	var cancelled: bool = false
+	var distance_ring: int
+	var layer_priority: int
+	var distance_priority: float
+	var sequence: int
 
 
-	func _init(_url: String, _custom_headers: PackedStringArray) -> void:
+	func _init(
+		_url: String,
+		_custom_headers: PackedStringArray,
+		_distance_ring: int,
+		_layer_priority: int,
+		_distance_priority: float,
+		_sequence: int,
+	) -> void:
 		url = _url
 		custom_headers = _custom_headers
+		distance_ring = _distance_ring
+		layer_priority = _layer_priority
+		distance_priority = _distance_priority
+		sequence = _sequence
 
 
 class Tile extends RefCounted:
@@ -1145,13 +1263,33 @@ class Tile extends RefCounted:
 		return not _img_data.is_empty()
 
 
-	func request_image(loader: TileLoader, url: String) -> void:
-		if has_image() or _pending_request != null:
+	func request_image(
+		loader: TileLoader,
+		url: String,
+		distance_ring: int,
+		layer_priority: int,
+		distance_priority: float,
+	) -> void:
+		if has_image():
 			return
 		if loader == null or url.is_empty():
 			return
+		if _pending_request != null:
+			loader.update_request_priority(
+				_pending_request,
+				distance_ring,
+				layer_priority,
+				distance_priority,
+			)
+			return
 
-		var pending := loader.queue_request(url)
+		var pending := loader.queue_request(
+			url,
+			PackedStringArray(),
+			distance_ring,
+			layer_priority,
+			distance_priority,
+		)
 		_pending_request = pending
 		var response: Array = await pending.completed
 
@@ -1168,6 +1306,22 @@ class Tile extends RefCounted:
 			image_updated.emit(definition)
 
 		request_completed.emit(definition, result, response_code)
+
+
+	func update_image_request_priority(
+		loader: TileLoader,
+		distance_ring: int,
+		layer_priority: int,
+		distance_priority: float,
+	) -> void:
+		if loader == null or _pending_request == null:
+			return
+		loader.update_request_priority(
+			_pending_request,
+			distance_ring,
+			layer_priority,
+			distance_priority,
+		)
 
 
 	func cancel_image_request(loader: TileLoader) -> bool:
@@ -1331,6 +1485,7 @@ class TileLoader extends Node:
 	var _workers: Array[HTTPRequest] = []
 	var _active_requests: Dictionary[HTTPRequest, TileRequest] = {}
 	var _pump_scheduled: bool = false
+	var _next_sequence: int = 0
 
 
 	func _ready() -> void:
@@ -1341,11 +1496,35 @@ class TileLoader extends Node:
 	func queue_request(
 		url: String,
 		custom_headers: PackedStringArray = PackedStringArray(),
+		distance_ring: int = 0,
+		layer_priority: int = 0,
+		distance_priority: float = 0.0,
 	) -> TileRequest:
-		var pending := TileRequest.new(url, custom_headers)
+		var pending := TileRequest.new(
+			url,
+			custom_headers,
+			distance_ring,
+			layer_priority,
+			distance_priority,
+			_next_sequence,
+		)
+		_next_sequence += 1
 		_request_queue.append(pending)
 		_schedule_pump()
 		return pending
+
+
+	func update_request_priority(
+		pending: TileRequest,
+		distance_ring: int,
+		layer_priority: int,
+		distance_priority: float,
+	) -> void:
+		if pending == null or pending.cancelled:
+			return
+		pending.distance_ring = distance_ring
+		pending.layer_priority = layer_priority
+		pending.distance_priority = distance_priority
 
 
 	func get_queued_request_count() -> int:
@@ -1395,7 +1574,7 @@ class TileLoader extends Node:
 			if worker == null:
 				return
 
-			var pending: TileRequest = _request_queue.pop_front()
+			var pending := _pop_highest_priority_request()
 			_active_requests[worker] = pending
 
 			if not allow_network:
@@ -1409,6 +1588,24 @@ class TileLoader extends Node:
 			var error := worker.request(pending.url, headers)
 			if error != OK:
 				_finish_request(worker, HTTPRequest.RESULT_REQUEST_FAILED, 0, PackedStringArray(), PackedByteArray())
+
+
+	func _pop_highest_priority_request() -> TileRequest:
+		var best_index := 0
+		for index in range(1, _request_queue.size()):
+			if _has_higher_priority(_request_queue[index], _request_queue[best_index]):
+				best_index = index
+		return _request_queue.pop_at(best_index)
+
+
+	func _has_higher_priority(candidate: TileRequest, current: TileRequest) -> bool:
+		if candidate.distance_ring != current.distance_ring:
+			return candidate.distance_ring < current.distance_ring
+		if candidate.layer_priority != current.layer_priority:
+			return candidate.layer_priority < current.layer_priority
+		if not is_equal_approx(candidate.distance_priority, current.distance_priority):
+			return candidate.distance_priority < current.distance_priority
+		return candidate.sequence < current.sequence
 
 
 	func _ensure_worker_pool() -> void:
