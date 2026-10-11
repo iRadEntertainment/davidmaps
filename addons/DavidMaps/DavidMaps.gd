@@ -62,7 +62,7 @@ signal overlay_changed(overlay: MapOverlay, enabled: bool)
 		visualization_scale = maxf(0.01, value)
 		if _provider != null and is_node_ready():
 			update()
-@export var map_layer: int = MapLayer.ROAD
+@export var map_layer: MapLayer = MapLayer.ROAD
 @export_range(0.0, 20.0, 0.01) var start_zoom: float = 10.0
 @export var start_longitude: float = 14.998
 @export var start_latitude: float = 40.897
