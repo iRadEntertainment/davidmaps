@@ -45,6 +45,9 @@ var language_code: String = "en"
 @export_group("Provider Credentials")
 @export var yandex_api_key: String = ""
 @export_group("")
+@export_group("Tile Cache")
+@export_range(1, 1000, 1) var max_cached_tiles: int = 50
+@export_group("")
 
 
 var _provider: Provider
@@ -56,10 +59,13 @@ var map_center_coord: Vector2
 var _target_zoom: float = 0.0
 var _rendered_tile_zoom: int = -1
 var _last_rendered_tile_zoom: int = -1
-var _loaded_tiles: Dictionary[TileKey, Tile] = {}
-var _visible_tiles: Dictionary[TileKey, Tile] = {}
-var _previous_rendered_tiles: Dictionary[TileKey, Tile] = {}
-var _tile_keys_by_index: Dictionary[Vector3i, TileKey] = {}
+var _rendered_source_id: StringName
+var _previous_rendered_source_id: StringName
+var _tile_cache := TileCache.new()
+var _visible_tiles: Dictionary[Vector3i, Tile] = {}
+var _previous_rendered_tiles: Dictionary[Vector3i, Tile] = {}
+var _debug_mouse_position: Vector2
+var _debug_mouse_inside: bool = false
 
 
 
@@ -239,15 +245,11 @@ func _draw_tile_layer(tile_zoom: int, renderer_size: Vector2, current_layer: boo
 			var x_wr: int = ((x_un % n) + n) % n
 
 			var tile_index := Vector3i(tile_zoom, x_wr, y_un) # (z,x,y)
-			var key: TileKey = _tile_keys_by_index.get(tile_index)
-			if key == null:
-				continue
-
 			var tile: Tile
 			if current_layer:
-				tile = _visible_tiles.get(key)
-			else:
-				tile = _previous_rendered_tiles.get(key)
+				tile = _visible_tiles.get(tile_index)
+			elif _previous_rendered_source_id == _provider.source.id:
+				tile = _previous_rendered_tiles.get(tile_index)
 			if tile == null:
 				continue
 
@@ -351,52 +353,79 @@ func _request_visible_tiles() -> void:
 		for x_un in range(tile_rect.position.x, tile_rect.end.x):
 			var x_wr := ((x_un % n) + n) % n
 			var tile_index := Vector3i(tile_zoom, x_wr, y_un)  # (z,x,y)
+			var definition := TileDefinition.new(_provider.source, tile_index)
 
-			var key := _get_or_create_tile_key(tile_index)
-			if _visible_tiles.has(key):
+			if _visible_tiles.has(tile_index):
 				continue
 
-			var tile: Tile = _loaded_tiles.get(key)
+			var tile := _tile_cache.get_tile(definition)
 			if tile == null:
-				tile = Tile.new(tile_index, _provider.img_format, key)
-				tile.image_updated.connect(_queue_renderer_redraw)
-				_loaded_tiles[key] = tile
+				tile = Tile.new(definition)
+				tile.image_updated.connect(_on_tile_image_updated)
+				_tile_cache.store_tile(tile)
 
-			_visible_tiles[key] = tile
+			_visible_tiles[tile_index] = tile
 			tile.request_image(tile_loader, _provider.url_from_index(tile_index))
+
+	_trim_tile_cache()
+
+
+func _on_tile_image_updated(definition: TileDefinition) -> void:
+	if definition.source.id == _provider.source.id:
+		_queue_renderer_redraw()
+
+
+func _trim_tile_cache() -> void:
+	while _tile_cache.size() > max_cached_tiles:
+		var eviction_entry := _tile_cache.find_least_recently_used(
+			_provider.source.id,
+			_visible_tiles,
+		)
+		if eviction_entry == null:
+			break
+		_evict_cached_tile(eviction_entry)
+
+
+func _evict_cached_tile(entry: TileCacheEntry) -> void:
+	entry.tile.cancel_image_request(tile_loader)
+	_tile_cache.remove_tile(entry.definition)
+	if entry.definition.source.id == _previous_rendered_source_id:
+		_previous_rendered_tiles.erase(entry.definition.index)
 
 
 func _track_rendered_tile_zoom(tile_zoom: int) -> void:
+	var source_id := _provider.source.id
+	if source_id != _rendered_source_id:
+		_previous_rendered_tiles.clear()
+		_previous_rendered_source_id = &""
+		_last_rendered_tile_zoom = -1
+		_cancel_obsolete_tile_requests(tile_zoom, source_id)
+		_rendered_source_id = source_id
+		_rendered_tile_zoom = tile_zoom
+		return
+
 	if tile_zoom == _rendered_tile_zoom:
 		return
 
-	var loaded_snapshot: Dictionary[TileKey, Tile] = {}
+	var loaded_snapshot: Dictionary[Vector3i, Tile] = {}
 	if _rendered_tile_zoom >= 0:
-		for key in _loaded_tiles:
-			var tile: Tile = _loaded_tiles[key]
+		for tile in _tile_cache.get_tiles_for_source(source_id):
 			if tile.index.x == _rendered_tile_zoom and tile.has_image():
-				loaded_snapshot[key] = tile
+				loaded_snapshot[tile.index] = tile
 
 	if not loaded_snapshot.is_empty():
 		_previous_rendered_tiles = loaded_snapshot
+		_previous_rendered_source_id = source_id
 		_last_rendered_tile_zoom = _rendered_tile_zoom
 
-	_cancel_obsolete_tile_requests(tile_zoom)
+	_cancel_obsolete_tile_requests(tile_zoom, source_id)
 	_rendered_tile_zoom = tile_zoom
 
 
-func _cancel_obsolete_tile_requests(current_tile_zoom: int) -> void:
-	for tile in _loaded_tiles.values():
-		if tile.index.x != current_tile_zoom:
+func _cancel_obsolete_tile_requests(current_tile_zoom: int, current_source_id: StringName) -> void:
+	for tile in _tile_cache.get_all_tiles():
+		if tile.definition.source.id != current_source_id or tile.index.x != current_tile_zoom:
 			tile.cancel_image_request(tile_loader)
-
-
-func _get_or_create_tile_key(tile_index: Vector3i) -> TileKey:
-	var key: TileKey = _tile_keys_by_index.get(tile_index)
-	if key == null:
-		key = TileKey.new(tile_index)
-		_tile_keys_by_index[tile_index] = key
-	return key
 
 
 func _get_tile_grid_rect(
@@ -445,6 +474,41 @@ func _tilef_to_coord(tile_coord: Vector2, zoom: float) -> Vector2:
 
 
 #region Inner Classes
+class TileSourceDefinition extends RefCounted:
+	var id: StringName
+	var provider_type: ProviderType
+	var layer_id: StringName
+	var language: StringName
+	var img_format: ImgFormat
+	var tile_size: Vector2i
+
+
+	func _init(
+		_id: StringName,
+		_provider_type: ProviderType,
+		_layer_id: StringName,
+		_language: StringName,
+		_img_format: ImgFormat,
+		_tile_size: Vector2i,
+	) -> void:
+		id = _id
+		provider_type = _provider_type
+		layer_id = _layer_id
+		language = _language
+		img_format = _img_format
+		tile_size = _tile_size
+
+
+class TileDefinition extends RefCounted:
+	var source: TileSourceDefinition
+	var index: Vector3i
+
+
+	func _init(_source: TileSourceDefinition, _index: Vector3i) -> void:
+		source = _source
+		index = _index
+
+
 class Provider extends RefCounted:
 	var type: ProviderType = ProviderType.OSM
 	var style: MapStyle = MapStyle.STREET
@@ -456,6 +520,7 @@ class Provider extends RefCounted:
 	var min_zoom: int = 0
 	var max_zoom: int = 19
 	var attribution_text: String
+	var source: TileSourceDefinition
 	
 	
 	func _init(
@@ -488,6 +553,7 @@ class Provider extends RefCounted:
 			ProviderType.WORLD_IMAGERY:
 				img_format = ImgFormat.JPG
 				attribution_text = "Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community"
+		source = _create_source_definition()
 
 
 	func get_configuration_error() -> String:
@@ -578,15 +644,37 @@ class Provider extends RefCounted:
 			_: return "map"
 
 
-class TileKey:
-	var zoom: int
-	var lon_idx: int
-	var lat_idx: int
-	
-	func _init(_index: Vector3i) -> void:
-		zoom = _index.x
-		lon_idx = _index.y
-		lat_idx = _index.z
+	func _create_source_definition() -> TileSourceDefinition:
+		var layer_id: StringName
+		var source_language: StringName
+		var source_id: StringName
+		match type:
+			ProviderType.BING:
+				layer_id = StringName(MapStyle.keys()[style].to_lower())
+				source_language = StringName(_bing_culture())
+				source_id = StringName("bing:%s:%s" % [layer_id, source_language])
+			ProviderType.YANDEX:
+				layer_id = StringName(_yandex_maptype())
+				source_language = StringName(_yandex_language())
+				source_id = StringName("yandex:%s:%s" % [layer_id, source_language])
+			ProviderType.TERRARIUM:
+				layer_id = &"elevation"
+				source_id = &"terrarium:elevation"
+			ProviderType.WORLD_IMAGERY:
+				layer_id = &"imagery"
+				source_id = &"world_imagery:imagery"
+			_:
+				layer_id = &"standard"
+				source_id = &"osm:standard"
+
+		return TileSourceDefinition.new(
+			source_id,
+			type,
+			layer_id,
+			source_language,
+			img_format,
+			Vector2i(tile_size),
+		)
 
 class TileRequest extends RefCounted:
 	signal completed(
@@ -607,9 +695,10 @@ class TileRequest extends RefCounted:
 
 
 class Tile extends RefCounted:
-	signal image_updated
-	signal request_completed(result: int, response_code: int)
+	signal image_updated(definition: TileDefinition)
+	signal request_completed(definition: TileDefinition, result: int, response_code: int)
 
+	var definition: TileDefinition
 	var index: Vector3i # (z, x, y) == (zoom level, longitude index, latitude index)
 	var img_format: ImgFormat = ImgFormat.PNG
 	
@@ -617,12 +706,11 @@ class Tile extends RefCounted:
 	var _img_data: PackedByteArray
 	var _texture: ImageTexture
 	var _pending_request: TileRequest
-	var key: TileKey
 	
-	func _init(_index: Vector3i, _img_format: ImgFormat, _key: TileKey = null) -> void:
-		index = _index
-		img_format = _img_format
-		key = _key if _key != null else TileKey.new(index)
+	func _init(_definition: TileDefinition) -> void:
+		definition = _definition
+		index = definition.index
+		img_format = definition.source.img_format
 	
 	
 	func has_image() -> bool:
@@ -649,9 +737,9 @@ class Tile extends RefCounted:
 		if result == HTTPRequest.RESULT_SUCCESS and response_code >= 200 and response_code < 300:
 			_img_data = body
 			_texture = null
-			image_updated.emit()
+			image_updated.emit(definition)
 
-		request_completed.emit(result, response_code)
+		request_completed.emit(definition, result, response_code)
 
 
 	func cancel_image_request(loader: TileLoader) -> bool:
@@ -680,6 +768,118 @@ class Tile extends RefCounted:
 			return null
 		_texture = ImageTexture.create_from_image(image)
 		return _texture
+
+
+class TileCacheEntry extends RefCounted:
+	var definition: TileDefinition
+	var tile: Tile
+	var last_used: int
+
+
+	func _init(_tile: Tile, _last_used: int) -> void:
+		tile = _tile
+		definition = tile.definition
+		last_used = _last_used
+
+
+class TileCache extends RefCounted:
+	var _tiles_by_source: Dictionary[StringName, Dictionary] = {}
+	var _tile_count: int = 0
+	var _access_serial: int = 0
+
+
+	func get_tile(definition: TileDefinition) -> Tile:
+		if not _tiles_by_source.has(definition.source.id):
+			return null
+		var source_tiles: Dictionary = _tiles_by_source[definition.source.id]
+
+		var entry: TileCacheEntry = source_tiles.get(definition.index)
+		if entry == null:
+			return null
+		_touch(entry)
+		return entry.tile
+
+
+	func store_tile(tile: Tile) -> void:
+		var source_id := tile.definition.source.id
+		var source_tiles: Dictionary
+		if _tiles_by_source.has(source_id):
+			source_tiles = _tiles_by_source[source_id]
+		else:
+			source_tiles = {}
+			_tiles_by_source[source_id] = source_tiles
+
+		var existing: TileCacheEntry = source_tiles.get(tile.index)
+		if existing != null:
+			existing.tile = tile
+			existing.definition = tile.definition
+			_touch(existing)
+			return
+
+		_access_serial += 1
+		source_tiles[tile.index] = TileCacheEntry.new(tile, _access_serial)
+		_tile_count += 1
+
+
+	func remove_tile(definition: TileDefinition) -> Tile:
+		var source_id := definition.source.id
+		if not _tiles_by_source.has(source_id):
+			return null
+		var source_tiles: Dictionary = _tiles_by_source[source_id]
+
+		var entry: TileCacheEntry = source_tiles.get(definition.index)
+		if entry == null:
+			return null
+		source_tiles.erase(definition.index)
+		_tile_count -= 1
+		if source_tiles.is_empty():
+			_tiles_by_source.erase(source_id)
+		return entry.tile
+
+
+	func get_tiles_for_source(source_id: StringName) -> Array[Tile]:
+		var tiles: Array[Tile] = []
+		if not _tiles_by_source.has(source_id):
+			return tiles
+		var source_tiles: Dictionary = _tiles_by_source[source_id]
+		for entry: TileCacheEntry in source_tiles.values():
+			tiles.append(entry.tile)
+		return tiles
+
+
+	func get_all_tiles() -> Array[Tile]:
+		var tiles: Array[Tile] = []
+		for source_tiles: Dictionary in _tiles_by_source.values():
+			for entry: TileCacheEntry in source_tiles.values():
+				tiles.append(entry.tile)
+		return tiles
+
+
+	func find_least_recently_used(
+		protected_source_id: StringName,
+		protected_indices: Dictionary,
+	) -> TileCacheEntry:
+		var oldest: TileCacheEntry
+		for source_id: StringName in _tiles_by_source:
+			var source_tiles: Dictionary = _tiles_by_source[source_id]
+			for tile_index: Vector3i in source_tiles:
+				if source_id == protected_source_id and protected_indices.has(tile_index):
+					continue
+				var entry: TileCacheEntry = source_tiles[tile_index]
+				if oldest == null or entry.last_used < oldest.last_used:
+					oldest = entry
+		return oldest
+
+
+	func size() -> int:
+		return _tile_count
+
+
+	func _touch(entry: TileCacheEntry) -> void:
+		_access_serial += 1
+		entry.last_used = _access_serial
+
+
 class TileLoader extends Node:
 	signal queue_drained
 
