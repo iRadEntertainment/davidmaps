@@ -57,6 +57,11 @@ signal overlay_changed(overlay: MapOverlay, enabled: bool)
 			map_layer = supported.front()
 		notify_property_list_changed()
 @export var show_attribution: bool = true
+@export_range(0.25, 2.50, 0.05, "or_greater") var visualization_scale: float = 1.0:
+	set(value):
+		visualization_scale = maxf(0.01, value)
+		if _provider != null and is_node_ready():
+			update()
 @export var map_layer: int = MapLayer.ROAD
 @export_range(0.0, 20.0, 0.01) var start_zoom: float = 10.0
 @export var start_longitude: float = 14.998
@@ -282,10 +287,11 @@ func fit_bounds(
 	var y_span := south_y - north_y
 
 	var target_zoom := float(_provider.max_zoom)
+	var scaled_tile_size := _provider.tile_size * visualization_scale
 	if x_span > 0.0:
-		target_zoom = minf(target_zoom, log(view_size.x / (_provider.tile_size.x * x_span)) / log(2.0))
+		target_zoom = minf(target_zoom, log(view_size.x / (scaled_tile_size.x * x_span)) / log(2.0))
 	if y_span > 0.0:
-		target_zoom = minf(target_zoom, log(view_size.y / (_provider.tile_size.y * y_span)) / log(2.0))
+		target_zoom = minf(target_zoom, log(view_size.y / (scaled_tile_size.y * y_span)) / log(2.0))
 
 	var center_world := Vector2(
 		fposmod((west + 180.0) / 360.0 + x_span * 0.5, 1.0),
@@ -515,7 +521,7 @@ func _set_zoom_level_at_screen_position(
 	var anchor_tile_f := _screen_to_tilef(screen_position, old_tile_zoom, _get_display_tile_size(old_tile_zoom))
 	var anchor_coord := _tilef_to_coord(anchor_tile_f, old_tile_zoom)
 	var new_tile_zoom := _tile_zoom_from_value(clamped_zoom)
-	var new_display_tile_size := _provider.tile_size * pow(2.0, clamped_zoom - new_tile_zoom)
+	var new_display_tile_size := _get_display_tile_size_at_zoom(new_tile_zoom, clamped_zoom)
 	var new_anchor_tile_f := _coord_to_tilef(anchor_coord, new_tile_zoom)
 	var screen_offset_tiles := (screen_position - cont_tile_renderer.size / 2.0) / new_display_tile_size
 	var new_center_f := new_anchor_tile_f - screen_offset_tiles
@@ -586,8 +592,12 @@ func _normalize_zoom(zoom: float) -> float:
 
 
 func _get_display_tile_size(tile_zoom: int) -> Vector2:
-	var scale := pow(2.0, _target_zoom - tile_zoom)
-	return _provider.tile_size * scale
+	return _get_display_tile_size_at_zoom(tile_zoom, _target_zoom)
+
+
+func _get_display_tile_size_at_zoom(tile_zoom: int, zoom: float) -> Vector2:
+	var fractional_zoom_scale := pow(2.0, zoom - tile_zoom)
+	return _provider.tile_size * visualization_scale * fractional_zoom_scale
 #endregion
 
 
