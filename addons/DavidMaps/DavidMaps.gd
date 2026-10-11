@@ -37,7 +37,7 @@ enum ImgFormat {JPG, PNG, BMP, WEBP, TGA}
 @export var show_attribution: bool = true
 @export var map_style: MapStyle = MapStyle.STREET
 @export var yandex_layer: YandexLayer = YandexLayer.MAP
-@export_range(0.0, 19.0, 0.5) var start_zoom: float = 10.0
+@export_range(0, 19, 1) var start_zoom: int = 10
 @export var start_longitude: float = 14.998
 @export var start_latitude: float = 40.897
 @export_enum("en", "it", "es", "fr", "ru", "de")
@@ -53,22 +53,16 @@ var cont_tile_renderer: Control
 var tile_canvas: Control
 
 var map_center_coord: Vector2
-var pointer_coord: Vector2
-var _last_zoom: int = -1
 var _target_zoom: int = 0
-var _current_zoom: float = 0
 var _loaded_tiles: Dictionary[TileKey, Tile] = {}
 var _visible_tiles: Dictionary[TileKey, Tile] = {}
-var _tiles_to_display: Array[TileKey] = []
 var _tile_keys_by_index: Dictionary[Vector3i, TileKey] = {}
-var _wanted_keys: Dictionary[Vector3i, bool] = {}
 
 
 
 #region Init
 func _ready() -> void:
 	if Engine.is_editor_hint():
-		set_process(false)
 		return
 
 	setup()
@@ -78,11 +72,9 @@ func _ready() -> void:
 
 
 func setup() -> void:
-	set_process(false)
 	map_center_coord = Vector2(start_longitude, start_latitude)
 	_provider = Provider.new(provider_type, map_style, language_code, yandex_api_key, yandex_layer)
-	_current_zoom = clampf(start_zoom, _provider.min_zoom, _provider.max_zoom)
-	_target_zoom = clampi(roundi(start_zoom), _provider.min_zoom, _provider.max_zoom)
+	_target_zoom = clampi(start_zoom, _provider.min_zoom, _provider.max_zoom)
 	var provider_error := _provider.get_configuration_error()
 	if not provider_error.is_empty():
 		push_warning(provider_error)
@@ -109,7 +101,6 @@ func setup_nodes() -> void:
 		return
 
 	tile_loader = TileLoader.new()
-	tile_loader.tile_provider = _provider
 	add_child(tile_loader)
 	
 	cont_tile_renderer = Control.new()
@@ -127,20 +118,23 @@ func setup_nodes() -> void:
 
 
 func _gui_input(event: InputEvent) -> void:
-	if not event is InputEventMouse: return
+	if not event is InputEventMouse:
+		return
+
 	if event is InputEventMouseMotion:
 		var dragging: bool = (event.button_mask & MOUSE_BUTTON_MASK_MIDDLE) != 0
 		if dragging:
 			_pan_by_screen_delta(event.relative)
 			update()
-	
-	if event is InputEventMouseButton:
-		if event.is_pressed():
-			if event.button_index == MOUSE_BUTTON_WHEEL_UP:
-				_target_zoom = clampi(_target_zoom + 1, _provider.min_zoom, _provider.max_zoom)
-			elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
-				_target_zoom = clampi(_target_zoom - 1, _provider.min_zoom, _provider.max_zoom)
-			update()
+		return
+
+	if not event is InputEventMouseButton or not event.is_pressed():
+		return
+
+	if event.button_index == MOUSE_BUTTON_WHEEL_UP:
+		set_zoom_level(_target_zoom + 1)
+	elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+		set_zoom_level(_target_zoom - 1)
 
 
 func _pan_by_screen_delta(screen_delta: Vector2) -> void:
@@ -156,29 +150,17 @@ func _pan_by_screen_delta(screen_delta: Vector2) -> void:
 	map_center_coord = _tilef_to_coord(center_f, zoom)
 
 
-var _tw_zoom: Tween
-func set_zoom_level(_new_zoom_level: int) -> void:
-	if _tw_zoom: _tw_zoom.kill()
-	_tw_zoom = create_tween()
-	_tw_zoom.set_ease(Tween.EASE_IN_OUT).set_trans(Tween.TRANS_CUBIC)
-	_tw_zoom.tween_callback(set_process.bind(true))
-	_tw_zoom.tween_property(self, ^"_current_zoom", _new_zoom_level, 0.5)
-	_tw_zoom.tween_property(self, ^"_last_zoom", _new_zoom_level, 0.0)
-	_tw_zoom.tween_callback(set_process.bind(false))
-
-
-func _process(_delta: float) -> void:
-	print(_delta)
-	_queue_renderer_redraw()
+func set_zoom_level(new_zoom_level: int) -> void:
+	var clamped_zoom := clampi(new_zoom_level, _provider.min_zoom, _provider.max_zoom)
+	if clamped_zoom == _target_zoom:
+		return
+	_target_zoom = clamped_zoom
+	update()
 
 
 #region Renderer
 func update() -> void:
 	if not is_node_ready(): return
-	if _last_zoom != _target_zoom:
-		_visible_tiles.clear()
-		_wanted_keys.clear()
-		_last_zoom = _target_zoom
 	_request_visible_tiles()
 	_queue_renderer_redraw()
 
@@ -189,7 +171,7 @@ func _queue_renderer_redraw() -> void:
 
 
 func _draw_renderer() -> void:
-	var center_f: Vector2 = _tile_coords_f(map_center_coord, _target_zoom)
+	var center_f: Vector2 = _coord_to_tilef(map_center_coord, _target_zoom)
 	var n: int = 1 << _target_zoom
 	var renderer_size := cont_tile_renderer.size
 	var center_screen := renderer_size / 2.0
@@ -295,11 +277,9 @@ func _draw_attribution() -> void:
 
 #region Tiles Requests
 func _request_visible_tiles() -> void:
-	_wanted_keys.clear()
 	_visible_tiles.clear()
-	_tiles_to_display.clear()
 	
-	var center_f := _tile_coords_f(map_center_coord, _target_zoom)
+	var center_f := _coord_to_tilef(map_center_coord, _target_zoom)
 	var n := 1 << _target_zoom
 	var tile_rect := _get_tile_grid_rect(center_f, cont_tile_renderer.size)
 
@@ -310,7 +290,6 @@ func _request_visible_tiles() -> void:
 		for x_un in range(tile_rect.position.x, tile_rect.end.x):
 			var x_wr := ((x_un % n) + n) % n
 			var tile_index := Vector3i(_target_zoom, x_wr, y_un)  # (z,x,y)
-			_wanted_keys[tile_index] = true
 
 			var key := _get_or_create_tile_key(tile_index)
 			if _visible_tiles.has(key):
@@ -318,14 +297,11 @@ func _request_visible_tiles() -> void:
 
 			var tile: Tile = _loaded_tiles.get(key)
 			if tile == null:
-				tile = Tile.new(tile_index, _provider.tile_size, key)
-				tile.provider_type = _provider.type
-				tile.img_format = _provider.img_format
+				tile = Tile.new(tile_index, _provider.img_format, key)
 				tile.image_updated.connect(_queue_renderer_redraw)
 				_loaded_tiles[key] = tile
 
 			_visible_tiles[key] = tile
-			_tiles_to_display.append(key)
 			tile.request_image(tile_loader, _provider.url_from_index(tile_index))
 
 
@@ -356,14 +332,6 @@ func _get_tile_grid_rect(
 
 
 #region Canvas/Tile Coord
-func _tile_coords_f(coord: Vector2, zoom: float) -> Vector2:
-	var lat_rad := deg_to_rad(coord.y)
-	var n := pow(2.0, zoom)
-	var x := (coord.x + 180.0) / 360.0 * n
-	var y := (1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / PI) / 2.0 * n
-	return Vector2(x, y)
-
-
 # Convert a pixel in renderer local coords to float tile coords
 func _screen_to_tilef(pix: Vector2, zoom: float) -> Vector2:
 	var center_f := _coord_to_tilef(map_center_coord, zoom)
@@ -386,86 +354,6 @@ func _tilef_to_coord(tile_coord: Vector2, zoom: float) -> Vector2:
 	return Vector2(longitude, latitude)
 
 
-func get_current_zoom_tilef_scale() -> float:
-	var diff: float = _current_zoom - _target_zoom
-	var tilef_scale: float = lerp(1.0, 2.0, diff)
-	return tilef_scale
-#endregion
-
-
-#region Script Signals
-#func _on_tile_loaded(status, tile: Tile) -> void:
-	#if status != OK or tile == null:
-		#return
-	## Drop non-current zoom immediately
-	#if tile.index.z != _target_zoom:
-		#return
-	#
-	#if not _wanted_keys.has(tile.index):
-		#return
-#
-	#var img := Image.new()
-	#var err := OK
-	#
-	#if tile.format == ImgFormat.JPG:
-		#err = img.load_jpg_from_buffer(tile.image)
-	#else:
-		#err = img.load_png_from_buffer(tile.image)
-	#if err != OK:
-		#return
-#
-	#_visible_tiles[tile.index] = ImageTexture.create_from_image(img)
-	#queue_redraw()
-#endregion
-
-
-#region Helpers
-static func longitude_to_tile_index(zoom: int, lon: float) -> int:
-	return floori((lon + 180.0) / 360.0 * (1 << zoom))
-
-
-static func latitude_to_tile_index(zoom: int, lat: float) -> int:
-	return floori(
-			(1.0 - log(tan(deg_to_rad(lat)) + 1.0 / cos(deg_to_rad(lat))) / PI) /
-			2.0 * (1 << zoom)
-	)
-
-
-static func coord_to_tile_index(zoom: int, lon: float, lat: float) -> Vector3i:
-	return Vector3i(zoom, longitude_to_tile_index(zoom, lon), latitude_to_tile_index(zoom, lat))
-
-
-static func tile_index_to_longitude(zoom: int, x: int) -> float:
-	return x * 360.0 / (1 << zoom) - 180.0
-
-
-static func tile_index_to_latitude(zoom: int, y: int) -> float:
-	return rad_to_deg(atan(sinh(PI * (1 - 2.0 * y / (1 << zoom)))))
-
-
-static func tile_index_to_coordinates(zoom: int, x: int, y: int) -> Vector2:
-	return Vector2(tile_index_to_latitude(y, zoom), tile_index_to_longitude(x, zoom))
-
-
-static func tile_index_to_bounds(zoom: int, x: int, y: int, tile_scale: float = 1.0) -> Rect2:
-	var lat = tile_index_to_latitude(zoom, y)
-	var lon = tile_index_to_longitude(zoom, x)
-	var pos := Vector2()
-	var bound_size := Vector2(
-		tile_index_to_longitude(zoom, x + 1) - lon,
-		tile_index_to_latitude(zoom, y - 1) - lat,
-	)
-	return Rect2(pos, bound_size)
-
-
-static func degrees_per_pixel(size: Vector2i, bounds: Rect2) -> Vector2:
-	var degrees = bounds.size
-	return Vector2(degrees.x / size.x, degrees.y / size.y)
-
-
-static func pixels_per_degree(size: Vector2i, bounds: Rect2) -> Vector2:
-	var degrees = bounds.size
-	return Vector2(size.x / degrees.x, size.y / degrees.y)
 #endregion
 
 
@@ -481,7 +369,6 @@ class Provider extends RefCounted:
 	var min_zoom: int = 0
 	var max_zoom: int = 19
 	var attribution_text: String
-	var attribution_url: String
 	
 	
 	func _init(
@@ -500,36 +387,26 @@ class Provider extends RefCounted:
 			ProviderType.OSM:
 				img_format = ImgFormat.PNG
 				attribution_text = "© OpenStreetMap contributors"
-				attribution_url = "https://www.openstreetmap.org/copyright"
 			ProviderType.BING:
 				img_format = ImgFormat.JPG
 				min_zoom = 1
 				attribution_text = "© Microsoft Bing"
-				attribution_url = "https://www.microsoft.com/maps/product/terms.html"
 			ProviderType.YANDEX:
 				img_format = ImgFormat.PNG
 				attribution_text = "© Yandex"
-				attribution_url = "https://yandex.com/legal/maps_termsofuse/"
 			ProviderType.TERRARIUM:
 				img_format = ImgFormat.PNG
 				max_zoom = 15
 				attribution_text = "Mapzen Terrain Tiles"
-				attribution_url = "https://github.com/tilezen/joerd/blob/master/docs/attribution.md"
 			ProviderType.WORLD_IMAGERY:
 				img_format = ImgFormat.JPG
 				attribution_text = "Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community"
-				attribution_url = "https://www.esri.com/en-us/legal/terms/full-master-agreement"
 
 
 	func get_configuration_error() -> String:
 		if type == ProviderType.YANDEX and api_key.is_empty():
 			return "Yandex Tiles API requires yandex_api_key. No Yandex tiles will be requested until it is set."
 		return ""
-	
-	
-	func url_from_coord(zoom: int, lon: float, lat: float) -> String:
-		var index: Vector3i = DavidMaps.coord_to_tile_index(zoom, lon, lat)
-		return url_from_index(index)
 	
 	
 	func url_from_index(tile_index: Vector3i) -> String:
@@ -624,11 +501,6 @@ class TileKey:
 		lon_idx = _index.y
 		lat_idx = _index.z
 
-
-	func to_vector3i() -> Vector3i:
-		return Vector3i(zoom, lon_idx, lat_idx)
-
-
 class TileRequest extends RefCounted:
 	signal completed(
 		result: int,
@@ -651,12 +523,6 @@ class Tile extends RefCounted:
 	signal request_completed(result: int, response_code: int)
 
 	var index: Vector3i # (z, x, y) == (zoom level, longitude index, latitude index)
-	var bounds: Rect2
-	var size: Vector2
-	
-	# from Map Provider
-	var provider_type: ProviderType
-	var tile_size: Vector2 = Vector2(256, 256)
 	var img_format: ImgFormat = ImgFormat.PNG
 	
 	# Data
@@ -665,11 +531,10 @@ class Tile extends RefCounted:
 	var _pending_request: TileRequest
 	var key: TileKey
 	
-	func _init(_index: Vector3i, _size: Vector2, _key: TileKey = null) -> void:
+	func _init(_index: Vector3i, _img_format: ImgFormat, _key: TileKey = null) -> void:
 		index = _index
-		size = _size
+		img_format = _img_format
 		key = _key if _key != null else TileKey.new(index)
-		bounds = DavidMaps.tile_index_to_bounds(key.zoom, key.lon_idx, key.lat_idx)
 	
 	
 	func has_image() -> bool:
@@ -721,37 +586,11 @@ class Tile extends RefCounted:
 			return null
 		_texture = ImageTexture.create_from_image(image)
 		return _texture
-	
-	
-	func save_to_file(filepath: String) -> void:
-		var f := FileAccess.open(filepath, FileAccess.WRITE)
-		f.store_var(index, true)
-		f.store_var(size, true)
-		f.store_32(img_format)
-		f.store_32(len(_img_data))
-		f.store_buffer(_img_data)
-		f.close()
-	
-	
-	static func from_file(filepath: String) -> Tile:
-		if not FileAccess.file_exists(filepath):
-			return null
-		var f := FileAccess.open(filepath, FileAccess.READ)
-		var _index: Vector3i = f.get_var(true)
-		var _size: Vector2 = f.get_var(true)
-		var _format: ImgFormat = f.get_32()
-		var _img_data_buffer_len: int = f.get_32()
-		var _img_data: PackedByteArray = f.get_buffer(_img_data_buffer_len)
-		return Tile.new(_index, _size)
-
-
 class TileLoader extends Node:
 	signal queue_drained
 
 	var user_agent: String = "Mozilla/5.0 Gecko/20100101 Firefox/118.0"
 	var allow_network: bool = true
-	var cache_tiles: bool = false
-	var tile_provider: Provider
 	var concurrent_requests: int = 4:
 		set(value):
 			concurrent_requests = maxi(1, value)
@@ -869,16 +708,4 @@ class TileLoader extends Node:
 			if header.to_lower().begins_with("user-agent:"):
 				return true
 		return false
-
-
-class TileRenderer extends TextureRect:
-	var index: Vector3i
-	var zoom: int:
-		get: return index.x
-	
-	
-	func _init(_index: Vector3i) -> void:
-		index = _index
-		expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-		stretch_mode = TextureRect.STRETCH_SCALE
 #endregion
