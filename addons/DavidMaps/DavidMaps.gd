@@ -53,6 +53,7 @@ var language_code: String = "en"
 var _provider: Provider
 var tile_loader: TileLoader
 var cont_tile_renderer: Control
+var cont_debug_renderer: Control
 var tile_canvas: Control
 
 var map_center_coord: Vector2
@@ -75,8 +76,6 @@ func _ready() -> void:
 		return
 
 	setup()
-	tile_canvas.draw.connect(_draw_renderer)
-	cont_tile_renderer.resized.connect(update)
 	update()
 
 
@@ -87,7 +86,35 @@ func setup() -> void:
 	var provider_error := _provider.get_configuration_error()
 	if not provider_error.is_empty():
 		push_warning(provider_error)
-	setup_nodes()
+	
+	# setup_nodes
+	if tile_loader == null:
+		tile_loader = TileLoader.new()
+		add_child(tile_loader)
+
+	cont_tile_renderer = Control.new()
+	cont_tile_renderer.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	cont_tile_renderer.clip_contents = true
+	cont_tile_renderer.clip_children = CanvasItem.CLIP_CHILDREN_ONLY
+	add_child(cont_tile_renderer)
+	cont_tile_renderer.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+
+	tile_canvas = Control.new()
+	tile_canvas.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	cont_tile_renderer.add_child(tile_canvas)
+	tile_canvas.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+
+	cont_debug_renderer = Control.new()
+	cont_debug_renderer.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	cont_debug_renderer.clip_contents = true
+	add_child(cont_debug_renderer)
+	cont_debug_renderer.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	
+	# connect signals
+	tile_canvas.draw.connect(_draw_renderer)
+	cont_debug_renderer.draw.connect(_draw_debug_renderer)
+	cont_tile_renderer.resized.connect(update)
+	mouse_exited.connect(_on_mouse_exited)
 
 
 func _validate_property(property: Dictionary) -> void:
@@ -103,26 +130,6 @@ func _validate_property(property: Dictionary) -> void:
 
 	if not is_visible:
 		property.usage = property.usage & ~PROPERTY_USAGE_EDITOR
-
-
-func setup_nodes() -> void:
-	if tile_loader != null:
-		return
-
-	tile_loader = TileLoader.new()
-	add_child(tile_loader)
-	
-	cont_tile_renderer = Control.new()
-	cont_tile_renderer.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	cont_tile_renderer.clip_contents = true
-	cont_tile_renderer.clip_children = CanvasItem.CLIP_CHILDREN_ONLY
-	add_child(cont_tile_renderer)
-	cont_tile_renderer.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-
-	tile_canvas = Control.new()
-	tile_canvas.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	cont_tile_renderer.add_child(tile_canvas)
-	tile_canvas.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 #endregion
 
 
@@ -131,6 +138,16 @@ func _gui_input(event: InputEvent) -> void:
 		return
 
 	if event is InputEventMouseMotion:
+		var event_canvas_position: Vector2 = get_global_transform_with_canvas() * event.position
+		_debug_mouse_position = (
+			cont_debug_renderer.get_global_transform_with_canvas().affine_inverse()
+			* event_canvas_position
+		)
+		_debug_mouse_inside = Rect2(Vector2.ZERO, cont_debug_renderer.size).has_point(
+			_debug_mouse_position
+		)
+		cont_debug_renderer.queue_redraw()
+
 		var dragging: bool = (event.button_mask & MOUSE_BUTTON_MASK_MIDDLE) != 0
 		if dragging:
 			_pan_by_screen_delta(event.relative)
@@ -213,6 +230,8 @@ func update() -> void:
 func _queue_renderer_redraw() -> void:
 	if tile_canvas != null:
 		tile_canvas.queue_redraw()
+	if cont_debug_renderer != null:
+		cont_debug_renderer.queue_redraw()
 
 
 func _draw_renderer() -> void:
@@ -221,16 +240,25 @@ func _draw_renderer() -> void:
 	if _last_rendered_tile_zoom >= 0 and _last_rendered_tile_zoom != tile_zoom:
 		_draw_tile_layer(_last_rendered_tile_zoom, renderer_size, false)
 	_draw_tile_layer(tile_zoom, renderer_size, true)
-
-	# debug
-	if debug_view_on:
-		var m_pos: Vector2 = get_global_mouse_position()
-		if cont_tile_renderer.get_global_rect().has_point(m_pos):
-			_draw_renderer_debug(cont_tile_renderer.get_local_mouse_position())
 	_draw_attribution()
 
 
-func _draw_tile_layer(tile_zoom: int, renderer_size: Vector2, current_layer: bool) -> void:
+func _draw_debug_renderer() -> void:
+	if not debug_view_on or not _debug_mouse_inside:
+		return
+	_draw_renderer_debug(_debug_mouse_position)
+
+
+func _on_mouse_exited() -> void:
+	_debug_mouse_inside = false
+	cont_debug_renderer.queue_redraw()
+
+
+func _draw_tile_layer(
+			tile_zoom: int,
+			renderer_size: Vector2,
+			current_layer: bool
+		) -> void:
 	var display_tile_size := _get_display_tile_size(tile_zoom)
 	var center_f: Vector2 = _coord_to_tilef(map_center_coord, tile_zoom)
 	var n: int = 1 << tile_zoom
@@ -287,7 +315,7 @@ func _draw_renderer_debug(mouse_pos: Vector2) -> void:
 	var r := Rect2(top_left, display_tile_size)
 
 	# Draw: outline + center label
-	tile_canvas.draw_rect(r, Color(1, 0.3, 0.1, 1.0), false, 2.0)  # outline
+	cont_debug_renderer.draw_rect(r, Color(1, 0.3, 0.1, 1.0), false, 2.0)  # outline
 
 	var font := get_theme_default_font()
 	var font_size := get_theme_default_font_size()
@@ -297,19 +325,32 @@ func _draw_renderer_debug(mouse_pos: Vector2) -> void:
 	var text_pos := top_left + display_tile_size * 0.5 - text_size * 0.5
 	# nudge down a bit to account for ascent
 	text_pos.y += font.get_ascent(font_size) * 0.5
-	tile_canvas.draw_string(font, text_pos, label, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, Color(1,1,1,0.95))
-
-	# (optional) small crosshair at mouse
-	tile_canvas.draw_line(mouse_pos + Vector2(-6, 0), mouse_pos + Vector2(6, 0), Color(1,1,1,0.5), 1.0)
-	tile_canvas.draw_line(mouse_pos + Vector2(0, -6), mouse_pos + Vector2(0, 6), Color(1,1,1,0.5), 1.0)
+	cont_debug_renderer.draw_string(
+		font,
+		text_pos,
+		label,
+		HORIZONTAL_ALIGNMENT_LEFT,
+		-1,
+		font_size,
+		Color(0.076, 0.076, 0.076, 0.95))
+	
+	# small crosshair at mouse
+	cont_debug_renderer.draw_line(
+		mouse_pos + Vector2(-6, 0),
+		mouse_pos + Vector2(6, 0),
+		Color(1,1,1,0.5), 1.0)
+	cont_debug_renderer.draw_line(
+		mouse_pos + Vector2(0, -6),
+		mouse_pos + Vector2(0, 6),
+		Color(1,1,1,0.5), 1.0)
 
 
 func _draw_tex_if_visible(
-	tex: Texture2D,
-	pos: Vector2,
-	display_tile_size: Vector2,
-	renderer_size: Vector2,
-) -> void:
+			tex: Texture2D,
+			pos: Vector2,
+			display_tile_size: Vector2,
+			renderer_size: Vector2,
+		) -> void:
 	# quick cull so we don't overdraw offscreen
 	var r := Rect2(pos, display_tile_size)
 	if r.end.x <= 0 or r.position.x >= renderer_size.x or r.end.y <= 0 or r.position.y >= renderer_size.y:
@@ -885,7 +926,7 @@ class TileLoader extends Node:
 
 	var user_agent: String = "Mozilla/5.0 Gecko/20100101 Firefox/118.0"
 	var allow_network: bool = true
-	var concurrent_requests: int = 4:
+	var concurrent_requests: int = 8:
 		set(value):
 			concurrent_requests = maxi(1, value)
 			_schedule_pump()
