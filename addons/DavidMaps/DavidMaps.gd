@@ -4,26 +4,36 @@ extends PanelContainer
 class_name DavidMaps
 
 #region Enums
+# Basemaps only; transparent thematic sources are in MapOverlay below.
 enum ProviderType {
-	OSM,
-	WORLD_IMAGERY,
-	TERRARIUM,
-	BING,
-	YANDEX,
+	OSM = 0,
+	WORLD_IMAGERY = 1,
+	TERRARIUM = 2,
+	OSM_FRANCE = 5,
+	CYCLOSM = 6,
+	OPENMAPS = 7,
+	OPNVKARTE = 8,
+	USGS = 9,
+	OPENTOPOMAP = 10,
 }
 
 enum MapLayer {
-	ROAD,
-	SATELLITE,
-	HYBRID,
-	TERRAIN,
-	FUTURE_MAP,
-	DRIVING,
-	TRANSIT,
-	ADMIN,
+	ROAD = 0,
+	SATELLITE = 1,
+	HYBRID = 2,
+	TERRAIN = 3,
+	TRANSIT = 6,
+	HIKING = 8,
+	TOPOGRAPHIC = 9,
+	CYCLING = 10,
+	CYCLING_LITE = 11,
+	HUMANITARIAN = 12,
+	SHADED_RELIEF = 13,
 }
 
-enum ImgFormat {JPG, PNG, BMP, WEBP, TGA}
+enum MapOverlay { SEAMARKS, RAILWAYS }
+
+enum ImgFormat {JPG, PNG, BMP, WEBP, TGA, AUTO}
 #endregion
 
 #region Signals
@@ -34,6 +44,7 @@ signal drag_started
 signal drag_ended
 signal provider_changed(provider: ProviderType)
 signal layer_changed(layer: MapLayer)
+signal overlay_changed(overlay: MapOverlay, enabled: bool)
 #endregion
 
 @export var debug_view_on: bool = true
@@ -47,18 +58,20 @@ signal layer_changed(layer: MapLayer)
 		notify_property_list_changed()
 @export var show_attribution: bool = true
 @export var map_layer: int = MapLayer.ROAD
-@export_range(0.0, 19.0, 0.01) var start_zoom: float = 10.0
+@export_range(0.0, 20.0, 0.01) var start_zoom: float = 10.0
 @export var start_longitude: float = 14.998
 @export var start_latitude: float = 40.897
-@export_enum("en", "it", "es", "fr", "ru", "de")
-var language_code: String = "en"
 @export_group("Navigation")
 @export_range(0.05, 5.0, 0.05, "suffix:s") var navigation_duration: float = 0.45
 @export var interaction_enabled: bool = true
 @export var pan_enabled: bool = true
 @export var zoom_enabled: bool = true
-@export_group("Provider Credentials")
-@export var yandex_api_key: String = ""
+@export_group("Overlays")
+@export_flags("Sea Marks", "Railways") var enabled_overlays: int = 0
+@export_group("Network")
+# Change this to a truthful, app-specific User-Agent with a contact URL/email
+# before shipping; community tile servers may block anonymous library agents.
+@export var tile_user_agent: String = "DavidMaps/1.0"
 @export_group("Tile Cache")
 @export_range(1, 1000, 1) var max_cached_tiles: int = 50
 @export_group("")
@@ -77,6 +90,10 @@ var _rendered_source_id: StringName
 var _previous_rendered_source_id: StringName
 var _tile_cache := TileCache.new()
 var _visible_tiles: Dictionary[Vector3i, Tile] = {}
+# Each enabled overlay has its own visible tile set and independently capped zoom.
+var _overlay_sources: Dictionary[MapOverlay, OverlaySource] = {}
+var _visible_overlay_tiles: Dictionary[MapOverlay, Dictionary] = {}
+var _overlay_tile_zooms: Dictionary[MapOverlay, int] = {}
 var _previous_rendered_tiles: Dictionary[Vector3i, Tile] = {}
 var _debug_mouse_position: Vector2
 var _debug_mouse_inside: bool = false
@@ -99,17 +116,17 @@ func _ready() -> void:
 
 func setup() -> void:
 	map_center_coord = _sanitize_coord(Vector2(start_longitude, start_latitude))
-	_provider = Provider.new(provider_type, map_layer, language_code, yandex_api_key)
+	_provider = Provider.new(provider_type, map_layer)
 	map_layer = _provider.layer
 	_target_zoom = clampf(start_zoom, _provider.min_zoom, _provider.max_zoom)
-	var provider_error := _provider.get_configuration_error()
-	if not provider_error.is_empty():
-		push_warning(provider_error)
 	
 	# setup_nodes
 	if tile_loader == null:
 		tile_loader = TileLoader.new()
 		add_child(tile_loader)
+	tile_loader.user_agent = tile_user_agent
+	_overlay_sources[MapOverlay.SEAMARKS] = OverlaySource.new(MapOverlay.SEAMARKS)
+	_overlay_sources[MapOverlay.RAILWAYS] = OverlaySource.new(MapOverlay.RAILWAYS)
 
 	cont_tile_renderer = Control.new()
 	cont_tile_renderer.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -138,21 +155,13 @@ func setup() -> void:
 
 func _validate_property(property: Dictionary) -> void:
 	var property_name: StringName = property.name
-	var is_visible := true
-	match property_name:
-		&"map_layer":
-			# Dynamic inspector enum: only show the selected provider's layers.
-			var options := PackedStringArray()
-			for layer in Provider.layers_for_type(provider_type):
-				options.append("%s:%d" % [MapLayer.keys()[layer].capitalize(), layer])
-			property.hint = PROPERTY_HINT_ENUM
-			property.hint_string = ",".join(options)
-		&"yandex_api_key":
-			is_visible = provider_type == ProviderType.YANDEX
-		&"language_code":
-			is_visible = provider_type == ProviderType.BING or provider_type == ProviderType.YANDEX
-	if not is_visible:
-		property.usage = property.usage & ~PROPERTY_USAGE_EDITOR
+	if property_name == &"map_layer":
+		# Dynamic inspector enum: only show the selected provider's layers.
+		var options := PackedStringArray()
+		for layer in Provider.layers_for_type(provider_type):
+			options.append("%s:%d" % [String(MapLayer.find_key(layer)).capitalize(), layer])
+		property.hint = PROPERTY_HINT_ENUM
+		property.hint_string = ",".join(options)
 #endregion
 
 
@@ -185,7 +194,8 @@ func go_to(zoom: float, lat: float, lon: float, tweened: bool = false) -> void:
 	if start_world.is_equal_approx(end_world) and is_equal_approx(start_zoom_value, target_zoom):
 		return
 
-	_navigation_tween = create_tween().set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_IN_OUT)
+	_navigation_tween = create_tween()
+	_navigation_tween.set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_IN_OUT)
 	_navigation_tween.tween_method(
 		_animate_view.bind(start_world, end_world, start_zoom_value, target_zoom),
 		0.0, 1.0, navigation_duration
@@ -306,11 +316,8 @@ func set_provider(type: ProviderType) -> void:
 	if _provider == null:
 		return
 	_cancel_navigation()
-	_provider = Provider.new(provider_type, map_layer, language_code, yandex_api_key)
+	_provider = Provider.new(provider_type, map_layer)
 	map_layer = _provider.layer
-	var configuration_error := _provider.get_configuration_error()
-	if not configuration_error.is_empty():
-		push_warning(configuration_error)
 	var clamped_zoom := clampf(_target_zoom, _provider.min_zoom, _provider.max_zoom)
 	if not is_equal_approx(clamped_zoom, _target_zoom):
 		_apply_view(clamped_zoom, map_center_coord)
@@ -331,11 +338,54 @@ func set_layer(layer: MapLayer) -> bool:
 	map_layer = layer
 	if _provider != null:
 		_cancel_navigation()
-		_provider = Provider.new(provider_type, map_layer, language_code, yandex_api_key)
+		_provider = Provider.new(provider_type, map_layer)
 		update()
 		layer_changed.emit(layer)
 	return true
 
+
+func get_available_overlays() -> Array[MapOverlay]:
+	return [MapOverlay.SEAMARKS, MapOverlay.RAILWAYS]
+
+
+func get_enabled_overlays() -> Array[MapOverlay]:
+	var result: Array[MapOverlay] = []
+	for overlay in get_available_overlays():
+		if is_overlay_enabled(overlay):
+			result.append(overlay)
+	return result
+
+
+func is_overlay_enabled(overlay: MapOverlay) -> bool:
+	if not get_available_overlays().has(overlay):
+		return false
+	return (enabled_overlays & (1 << int(overlay))) != 0
+
+
+func set_overlay_enabled(overlay: MapOverlay, enabled: bool) -> void:
+	if not get_available_overlays().has(overlay):
+		return
+	if is_overlay_enabled(overlay) == enabled:
+		return
+	var bit := 1 << int(overlay)
+	if enabled:
+		enabled_overlays |= bit
+	else:
+		enabled_overlays &= ~bit
+	if _provider != null:
+		update()
+	overlay_changed.emit(overlay, enabled)
+
+
+# Return provider attribution destinations for a host application's clickable UI.
+func get_attribution_links() -> PackedStringArray:
+	var urls := _provider.attribution_urls.duplicate() if _provider != null else PackedStringArray()
+	for overlay in get_enabled_overlays():
+		if _overlay_sources.has(overlay):
+			for url in _overlay_sources[overlay].attribution_urls:
+				if not urls.has(url):
+					urls.append(url)
+	return urls
 
 # These flags govern built-in gestures, NOT map_mouse_event delivery.
 func set_interaction_enabled(enabled: bool) -> void:
@@ -519,8 +569,14 @@ func _draw_renderer() -> void:
 	var tile_zoom := _get_tile_zoom_level()
 	var renderer_size := cont_tile_renderer.size
 	if _last_rendered_tile_zoom >= 0 and _last_rendered_tile_zoom != tile_zoom:
-		_draw_tile_layer(_last_rendered_tile_zoom, renderer_size, false)
-	_draw_tile_layer(tile_zoom, renderer_size, true)
+		if _previous_rendered_source_id == _provider.source.id:
+			_draw_tile_layer(_last_rendered_tile_zoom, renderer_size, _previous_rendered_tiles)
+	_draw_tile_layer(tile_zoom, renderer_size, _visible_tiles)
+	for overlay in get_enabled_overlays():
+		if _visible_overlay_tiles.has(overlay) and _overlay_tile_zooms.has(overlay):
+			_draw_tile_layer(
+				_overlay_tile_zooms[overlay], renderer_size, _visible_overlay_tiles[overlay]
+			)
 	_draw_attribution()
 
 
@@ -538,7 +594,7 @@ func _on_mouse_exited() -> void:
 func _draw_tile_layer(
 			tile_zoom: int,
 			renderer_size: Vector2,
-			current_layer: bool
+			tiles: Dictionary
 		) -> void:
 	var display_tile_size := _get_display_tile_size(tile_zoom)
 	var center_f: Vector2 = _coord_to_tilef(map_center_coord, tile_zoom)
@@ -554,11 +610,7 @@ func _draw_tile_layer(
 			var x_wr: int = ((x_un % n) + n) % n
 
 			var tile_index := Vector3i(tile_zoom, x_wr, y_un) # (z,x,y)
-			var tile: Tile
-			if current_layer:
-				tile = _visible_tiles.get(tile_index)
-			elif _previous_rendered_source_id == _provider.source.id:
-				tile = _previous_rendered_tiles.get(tile_index)
+			var tile: Tile = tiles.get(tile_index)
 			if tile == null:
 				continue
 
@@ -640,26 +692,54 @@ func _draw_tex_if_visible(
 
 
 func _draw_attribution() -> void:
-	if not show_attribution: return
+	if not show_attribution:
+		return
 	var font := get_theme_default_font()
 	var fs := get_theme_default_font_size()
-	var pad := Vector2(8, 6)
-	var text := _provider.attribution_text
-	var text_size := font.get_string_size(text, fs)
-	var box := Rect2(
-		cont_tile_renderer.size - text_size - pad * 2.0 - Vector2(8, 8),
-		text_size + pad * 2.0
-	)
-	tile_canvas.draw_rect(box, Color(0,0,0,0.55), true)
-	tile_canvas.draw_rect(box, Color(1,1,1,0.25), false, 1.0)
-	var pos := box.position + pad + Vector2(0, font.get_ascent(fs))
-	tile_canvas.draw_string(font, pos, text, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, Color(1,1,1,0.96))
+	var renderer_size := cont_tile_renderer.size
+	var max_text_width := maxf(40.0, renderer_size.x - 32.0)
+	var attributions := PackedStringArray([_provider.attribution_text])
+	for overlay in get_enabled_overlays():
+		if _overlay_sources.has(overlay):
+			attributions.append(_overlay_sources[overlay].attribution_text)
+	# Wrap lengthy attribution strings so they are visible in narrower widgets.
+	var lines := PackedStringArray()
+	for attribution in attributions:
+		var line := ""
+		for word in attribution.split(" ", false):
+			var candidate := word if line.is_empty() else line + " " + word
+			if not line.is_empty() and font.get_string_size(candidate, fs).x > max_text_width:
+				lines.append(line)
+				line = word
+			else:
+				line = candidate
+		if not line.is_empty():
+			lines.append(line)
+	if lines.is_empty():
+		return
+	var widest := 0.0
+	for line in lines:
+		widest = maxf(widest, font.get_string_size(line, fs).x)
+	var line_height := font.get_height(fs) + 2.0
+	var pad := Vector2(8, 5)
+	var box_size := Vector2(widest, line_height * lines.size()) + pad * 2.0
+	var box := Rect2(Vector2(maxf(0.0, renderer_size.x - box_size.x - 5.0),
+		maxf(0.0, renderer_size.y - box_size.y - 5.0)), box_size)
+	tile_canvas.draw_rect(box, Color(0, 0, 0, 0.65), true)
+	var cursor := box.position + pad + Vector2(0.0, font.get_ascent(fs))
+	for line in lines:
+		tile_canvas.draw_string(font, cursor, line, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, Color.WHITE)
+		cursor.y += line_height
+
+
 #endregion
 
 
 #region Tiles Requests
 func _request_visible_tiles() -> void:
 	_visible_tiles.clear()
+	_visible_overlay_tiles.clear()
+	_overlay_tile_zooms.clear()
 
 	var tile_zoom := _get_tile_zoom_level()
 	_track_rendered_tile_zoom(tile_zoom)
@@ -671,38 +751,85 @@ func _request_visible_tiles() -> void:
 	for y_un in range(tile_rect.position.y, tile_rect.end.y):
 		if y_un < 0 or y_un >= n:
 			continue
-
 		for x_un in range(tile_rect.position.x, tile_rect.end.x):
-			var x_wr := ((x_un % n) + n) % n
-			var tile_index := Vector3i(tile_zoom, x_wr, y_un)  # (z,x,y)
-			var definition := TileDefinition.new(_provider.source, tile_index)
-
+			var x_wr := posmod(x_un, n)
+			var tile_index := Vector3i(tile_zoom, x_wr, y_un)
 			if _visible_tiles.has(tile_index):
 				continue
+			_visible_tiles[tile_index] = _get_or_request_tile(
+				_provider.source, tile_index, _provider.url_from_index(tile_index)
+			)
 
-			var tile := _tile_cache.get_tile(definition)
-			if tile == null:
-				tile = Tile.new(definition)
-				tile.image_updated.connect(_on_tile_image_updated)
-				_tile_cache.store_tile(tile)
+	# Overlays use independent zoom limits; high-zoom maps can upscale their
+	# last native level, and low-zoom maps skip unsupported overlay levels.
+	for overlay in get_enabled_overlays():
+		var overlay_source: OverlaySource = _overlay_sources[overlay]
+		if tile_zoom < overlay_source.min_zoom:
+			continue
+		var overlay_zoom := mini(tile_zoom, overlay_source.max_zoom)
+		_overlay_tile_zooms[overlay] = overlay_zoom
+		var overlay_tiles: Dictionary = {}
+		_visible_overlay_tiles[overlay] = overlay_tiles
+		var overlay_n := 1 << overlay_zoom
+		var overlay_rect := _get_tile_grid_rect(
+			_coord_to_tilef(map_center_coord, overlay_zoom),
+			cont_tile_renderer.size, _get_display_tile_size(overlay_zoom)
+		)
+		for y_un in range(overlay_rect.position.y, overlay_rect.end.y):
+			if y_un < 0 or y_un >= overlay_n:
+				continue
+			for x_un in range(overlay_rect.position.x, overlay_rect.end.x):
+				var tile_index := Vector3i(overlay_zoom, posmod(x_un, overlay_n), y_un)
+				if overlay_tiles.has(tile_index):
+					continue
+				overlay_tiles[tile_index] = _get_or_request_tile(
+					overlay_source.source, tile_index, overlay_source.url_from_index(tile_index)
+				)
 
-			_visible_tiles[tile_index] = tile
-			tile.request_image(tile_loader, _provider.url_from_index(tile_index))
-
+	_cancel_obsolete_tile_requests()
 	_trim_tile_cache()
+
+
+func _get_or_request_tile(source: TileSourceDefinition, index: Vector3i, url: String) -> Tile:
+	var definition := TileDefinition.new(source, index)
+	var tile := _tile_cache.get_tile(definition)
+	if tile == null:
+		tile = Tile.new(definition)
+		tile.image_updated.connect(_on_tile_image_updated)
+		_tile_cache.store_tile(tile)
+	tile.request_image(tile_loader, url)
+	return tile
+
+
+func _get_protected_tiles() -> Dictionary:
+	var protected: Dictionary = {}
+	protected[_provider.source.id] = _visible_tiles
+	for overlay in _visible_overlay_tiles:
+		protected[_overlay_sources[overlay].source.id] = _visible_overlay_tiles[overlay]
+	return protected
+
+
+func _cancel_obsolete_tile_requests() -> void:
+	var protected := _get_protected_tiles()
+	for tile in _tile_cache.get_all_tiles():
+		var source_id := tile.definition.source.id
+		if not protected.has(source_id) or not protected[source_id].has(tile.index):
+			tile.cancel_image_request(tile_loader)
 
 
 func _on_tile_image_updated(definition: TileDefinition) -> void:
 	if definition.source.id == _provider.source.id:
 		_queue_renderer_redraw()
+		return
+	for overlay in get_enabled_overlays():
+		if _overlay_sources[overlay].source.id == definition.source.id:
+			_queue_renderer_redraw()
+			return
 
 
 func _trim_tile_cache() -> void:
 	while _tile_cache.size() > max_cached_tiles:
-		var eviction_entry := _tile_cache.find_least_recently_used(
-			_provider.source.id,
-			_visible_tiles,
-		)
+		var eviction_entry := _tile_cache.find_least_recently_used(_get_protected_tiles())
 		if eviction_entry == null:
 			break
 		_evict_cached_tile(eviction_entry)
@@ -721,7 +848,6 @@ func _track_rendered_tile_zoom(tile_zoom: int) -> void:
 		_previous_rendered_tiles.clear()
 		_previous_rendered_source_id = &""
 		_last_rendered_tile_zoom = -1
-		_cancel_obsolete_tile_requests(tile_zoom, source_id)
 		_rendered_source_id = source_id
 		_rendered_tile_zoom = tile_zoom
 		return
@@ -740,14 +866,7 @@ func _track_rendered_tile_zoom(tile_zoom: int) -> void:
 		_previous_rendered_source_id = source_id
 		_last_rendered_tile_zoom = _rendered_tile_zoom
 
-	_cancel_obsolete_tile_requests(tile_zoom, source_id)
 	_rendered_tile_zoom = tile_zoom
-
-
-func _cancel_obsolete_tile_requests(current_tile_zoom: int, current_source_id: StringName) -> void:
-	for tile in _tile_cache.get_all_tiles():
-		if tile.definition.source.id != current_source_id or tile.index.x != current_tile_zoom:
-			tile.cancel_image_request(tile_loader)
 
 
 func _get_tile_grid_rect(
@@ -800,25 +919,14 @@ func _tilef_to_coord(tile_coord: Vector2, zoom: float) -> Vector2:
 #region Inner Classes
 class TileSourceDefinition extends RefCounted:
 	var id: StringName
-	var provider_type: ProviderType
 	var layer_id: StringName
-	var language: StringName
 	var img_format: ImgFormat
 	var tile_size: Vector2i
 
-
-	func _init(
-				_id: StringName,
-				_provider_type: ProviderType,
-				_layer_id: StringName,
-				_language: StringName,
-				_img_format: ImgFormat,
-				_tile_size: Vector2i,
-			) -> void:
+	func _init(_id: StringName, _layer_id: StringName,
+			_img_format: ImgFormat, _tile_size: Vector2i) -> void:
 		id = _id
-		provider_type = _provider_type
 		layer_id = _layer_id
-		language = _language
 		img_format = _img_format
 		tile_size = _tile_size
 
@@ -827,176 +935,173 @@ class TileDefinition extends RefCounted:
 	var source: TileSourceDefinition
 	var index: Vector3i
 
-
 	func _init(_source: TileSourceDefinition, _index: Vector3i) -> void:
 		source = _source
 		index = _index
 
 
+# Raster basemap. See the suppliers' tile policies before distributing an app.
 class Provider extends RefCounted:
 	var type: ProviderType = ProviderType.OSM
 	var layer: MapLayer = MapLayer.ROAD
 	var available_layers: Array[MapLayer] = []
 	var img_format: ImgFormat = ImgFormat.PNG
-	var language_code: String = "en"
-	var api_key: String
 	var tile_size: Vector2 = Vector2(256, 256)
 	var min_zoom: int = 0
 	var max_zoom: int = 19
-	var attribution_text: String
+	var attribution_text: String = ""
+	var attribution_urls: PackedStringArray = PackedStringArray()
 	var source: TileSourceDefinition
-
 
 	static func layers_for_type(provider: ProviderType) -> Array[MapLayer]:
 		match provider:
-			ProviderType.OSM:
+			ProviderType.OSM, ProviderType.OSM_FRANCE:
+				if provider == ProviderType.OSM_FRANCE:
+					return [MapLayer.ROAD, MapLayer.HUMANITARIAN]
 				return [MapLayer.ROAD]
-			ProviderType.BING:
-				return [MapLayer.ROAD, MapLayer.SATELLITE, MapLayer.HYBRID]
-			ProviderType.YANDEX:
-				return [MapLayer.ROAD, MapLayer.FUTURE_MAP, MapLayer.DRIVING, MapLayer.TRANSIT, MapLayer.ADMIN]
+			ProviderType.CYCLOSM:
+				return [MapLayer.CYCLING, MapLayer.CYCLING_LITE]
+			ProviderType.OPENMAPS:
+				return [MapLayer.HIKING, MapLayer.TOPOGRAPHIC]
+			ProviderType.OPNVKARTE:
+				return [MapLayer.TRANSIT]
+			ProviderType.USGS:
+				return [MapLayer.TOPOGRAPHIC, MapLayer.SHADED_RELIEF, MapLayer.SATELLITE, MapLayer.HYBRID]
+			ProviderType.OPENTOPOMAP:
+				return [MapLayer.TOPOGRAPHIC]
 			ProviderType.TERRARIUM:
 				return [MapLayer.TERRAIN]
 			ProviderType.WORLD_IMAGERY:
 				return [MapLayer.SATELLITE]
 		return [MapLayer.ROAD]
 
-
-	func _init(
-				_provider_type: ProviderType,
-				_map_layer: MapLayer = MapLayer.ROAD,
-				_language_code: String = "en",
-				_api_key: String = "",
-			) -> void:
+	func _init(_provider_type: ProviderType,
+			_map_layer: MapLayer = MapLayer.ROAD) -> void:
 		type = _provider_type
 		available_layers = layers_for_type(type)
 		layer = _map_layer if available_layers.has(_map_layer) else available_layers[0]
-		language_code = _language_code
-		api_key = _api_key
+		var osm_link := "https://www.openstreetmap.org/copyright"
 		match type:
 			ProviderType.OSM:
-				img_format = ImgFormat.PNG
 				attribution_text = "© OpenStreetMap contributors"
-			ProviderType.BING:
-				img_format = ImgFormat.JPG
-				min_zoom = 1
-				attribution_text = "© Microsoft Bing"
-			ProviderType.YANDEX:
-				img_format = ImgFormat.PNG
-				attribution_text = "© Yandex"
+				attribution_urls = [osm_link]
+				max_zoom = 19
+			ProviderType.OSM_FRANCE:
+				attribution_text = "© OpenStreetMap contributors · OSM France / HOT"
+				attribution_urls = [osm_link, "https://www.openstreetmap.fr/"]
+				max_zoom = 20 if layer == MapLayer.ROAD else 19
+			ProviderType.CYCLOSM:
+				attribution_text = "© OpenStreetMap contributors · CyclOSM (CC BY-SA)"
+				attribution_urls = [osm_link, "https://www.cyclosm.org/"]
+				max_zoom = 20
+			ProviderType.OPENMAPS:
+				attribution_text = (
+					"© OpenStreetMap · OpenHikingMap · donate: openmaps.fr/donate"
+					if layer == MapLayer.HIKING else
+					"© OpenStreetMap · OpenTopoMap-R · donate: openmaps.fr/donate"
+				)
+				attribution_urls = [osm_link, "https://openmaps.fr/donate",
+					"https://wiki.openstreetmap.org/wiki/OpenHikingMap" if layer == MapLayer.HIKING
+					else "https://github.com/sletuffe/OpenTopoMap"]
+				max_zoom = 19
+			ProviderType.OPNVKARTE:
+				attribution_text = "Map © MeMoMaps CC BY-SA · Data © OpenStreetMap ODbL"
+				attribution_urls = ["https://memomaps.de/", osm_link]
+				max_zoom = 18
+			ProviderType.USGS:
+				img_format = ImgFormat.AUTO # ArcGIS tiles are MIXED PNG/JPEG.
+				attribution_text = "USGS The National Map / USDA (where applicable)"
+				attribution_urls = ["https://www.usgs.gov/programs/national-geospatial-program/national-map"]
+				max_zoom = 19
+			ProviderType.OPENTOPOMAP:
+				attribution_text = "© OpenTopoMap (CC BY-SA) · © OpenStreetMap"
+				attribution_urls = ["https://opentopomap.org/", osm_link]
+				max_zoom = 17
 			ProviderType.TERRARIUM:
-				img_format = ImgFormat.PNG
+				attribution_text = "Mapzen Terrarium elevation tiles"
+				attribution_urls = ["https://registry.opendata.aws/terrain-tiles/"]
 				max_zoom = 15
-				attribution_text = "Mapzen Terrain Tiles"
 			ProviderType.WORLD_IMAGERY:
-				img_format = ImgFormat.JPG
-				attribution_text = "Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community"
+				img_format = ImgFormat.AUTO
+				attribution_text = "Tiles © Esri · Esri, Maxar, Earthstar Geographics, GIS User Community"
+				attribution_urls = ["https://www.esri.com/en-us/legal/terms/full-master-agreement"]
+				max_zoom = 19
 		source = _create_source_definition()
 
-
-	func get_configuration_error() -> String:
-		if type == ProviderType.YANDEX and api_key.is_empty():
-			return "Yandex Tiles API requires yandex_api_key. No Yandex tiles will be requested until it is set."
-		return ""
-
-
 	func url_from_index(tile_index: Vector3i) -> String:
-		var zoom: int = tile_index.x
-		var x: int = tile_index.y
-		var y: int = tile_index.z
+		var z := tile_index.x
+		var x := tile_index.y
+		var y := tile_index.z
 		match type:
-			ProviderType.BING:
-				var prefix: String
-				match layer:
-					MapLayer.SATELLITE: prefix = "a"
-					MapLayer.HYBRID: prefix = "h"
-					_: prefix = "r"
-				var quadkey := _construct_quadkey(x, y, zoom)
-				var subdomain := posmod(x + y, 4)
-				return "https://ecn.t%d.tiles.virtualearth.net/tiles/%s%s.jpeg?g=1&mkt=%s" % [
-					subdomain, prefix, quadkey, _bing_culture(),
-				]
-
 			ProviderType.OSM:
-				return "https://tile.openstreetmap.org/%d/%d/%d.png" % [zoom, x, y]
-
-			ProviderType.YANDEX:
-				if api_key.is_empty():
-					return ""
-				return "https://tiles.api-maps.yandex.ru/v1/tiles/?apikey=%s&lang=%s&x=%d&y=%d&z=%d&l=map&projection=web_mercator&maptype=%s" % [
-					api_key.uri_encode(), _yandex_language(), x, y, zoom, _yandex_maptype(),
-				]
-
+				return "https://tile.openstreetmap.org/%d/%d/%d.png" % [z, x, y]
+			ProviderType.OSM_FRANCE:
+				var style := "hot" if layer == MapLayer.HUMANITARIAN else "osmfr"
+				return "https://a.tile.openstreetmap.fr/%s/%d/%d/%d.png" % [style, z, x, y]
+			ProviderType.CYCLOSM:
+				var style := "cyclosm-lite" if layer == MapLayer.CYCLING_LITE else "cyclosm"
+				return "https://a.tile-cyclosm.openstreetmap.fr/%s/%d/%d/%d.png" % [style, z, x, y]
+			ProviderType.OPENMAPS:
+				var style := "openhikingmap" if layer == MapLayer.HIKING else "opentopomap"
+				return "https://tile.openmaps.fr/%s/%d/%d/%d.png" % [style, z, x, y]
+			ProviderType.OPNVKARTE:
+				return "https://tile.memomaps.de/tilegen/%d/%d/%d.png" % [z, x, y]
+			ProviderType.USGS:
+				var service := "USGSTopo"
+				match layer:
+					MapLayer.SHADED_RELIEF: service = "USGSShadedReliefOnly"
+					MapLayer.SATELLITE: service = "USGSImageryOnly"
+					MapLayer.HYBRID: service = "USGSImageryTopo"
+				return "https://basemap.nationalmap.gov/arcgis/rest/services/%s/MapServer/tile/%d/%d/%d" % [service, z, y, x]
+			ProviderType.OPENTOPOMAP:
+				return "https://a.tile.opentopomap.org/%d/%d/%d.png" % [z, x, y]
 			ProviderType.TERRARIUM:
-				return "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/%d/%d/%d.png" % [zoom, x, y]
-
+				return "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/%d/%d/%d.png" % [z, x, y]
 			ProviderType.WORLD_IMAGERY:
-				return "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/%d/%d/%d" % [zoom, y, x]
-
+				return "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/%d/%d/%d" % [z, y, x]
 		return ""
-
-
-	func _construct_quadkey(x: int, y: int, zoom: int) -> String:
-		var quadkey := ""
-		for level in range(zoom, 0, -1):
-			var digit := 0
-			var mask := 1 << (level - 1)
-			if (x & mask) != 0:
-				digit += 1
-			if (y & mask) != 0:
-				digit += 2
-			quadkey += str(digit)
-		return quadkey
-
-
-	func _bing_culture() -> String:
-		match language_code:
-			"it": return "it-IT"
-			"es": return "es-ES"
-			"fr": return "fr-FR"
-			"ru": return "ru-RU"
-			"de": return "de-DE"
-			_: return "en-US"
-
-
-	func _yandex_language() -> String:
-		if language_code == "ru":
-			return "ru_RU"
-		return "en_US"
-
-
-	func _yandex_maptype() -> String:
-		match layer:
-			MapLayer.FUTURE_MAP: return "future_map"
-			MapLayer.DRIVING: return "driving"
-			MapLayer.TRANSIT: return "transit"
-			MapLayer.ADMIN: return "admin"
-			_: return "map"
-
 
 	func _create_source_definition() -> TileSourceDefinition:
-		var layer_id: StringName = StringName(MapLayer.keys()[layer].to_lower())
-		var source_language: StringName
-		var source_id: StringName
-		match type:
-			ProviderType.BING:
-				source_language = StringName(_bing_culture())
-				source_id = StringName("bing:%s:%s" % [layer_id, source_language])
-			ProviderType.YANDEX:
-				layer_id = StringName(_yandex_maptype())
-				source_language = StringName(_yandex_language())
-				source_id = StringName("yandex:%s:%s" % [layer_id, source_language])
-			ProviderType.TERRARIUM:
-				source_id = &"terrarium:terrain"
-			ProviderType.WORLD_IMAGERY:
-				source_id = &"world_imagery:satellite"
-			_:
-				source_id = &"osm:road"
+		var layer_id := StringName(String(MapLayer.find_key(layer)).to_lower())
+		var source_id := StringName("base:%d:%s" % [int(type), layer_id])
+		return TileSourceDefinition.new(source_id, layer_id, img_format, Vector2i(tile_size))
 
-		return TileSourceDefinition.new(
-			source_id, type, layer_id, source_language,
-			img_format, Vector2i(tile_size),
-		)
+
+class OverlaySource extends RefCounted:
+	var type: MapOverlay
+	var min_zoom: int = 0
+	var max_zoom: int = 19
+	var attribution_text: String
+	var attribution_urls: PackedStringArray
+	var source: TileSourceDefinition
+
+	func _init(overlay: MapOverlay) -> void:
+		type = overlay
+		match type:
+			MapOverlay.SEAMARKS:
+				min_zoom = 0
+				max_zoom = 18
+				attribution_text = "Seamarks © OpenSeaMap · © OpenStreetMap (not for navigation)"
+				attribution_urls = ["https://www.openseamap.org/", "https://www.openstreetmap.org/copyright"]
+				source = TileSourceDefinition.new(&"overlay:openseamap:seamarks", &"seamarks", ImgFormat.PNG, Vector2i(256, 256))
+			MapOverlay.RAILWAYS:
+				min_zoom = 2
+				max_zoom = 19
+				attribution_text = "Railways © OpenRailwayMap (CC BY-SA 2.0) · © OpenStreetMap"
+				attribution_urls = ["https://www.openrailwaymap.org/", "https://creativecommons.org/licenses/by-sa/2.0/", "https://www.openstreetmap.org/copyright"]
+				# Served as 512px retina images for a logical 256px tile.
+				source = TileSourceDefinition.new(&"overlay:openrailwaymap:standard", &"railways", ImgFormat.PNG, Vector2i(256, 256))
+
+	func url_from_index(tile_index: Vector3i) -> String:
+		var z := tile_index.x
+		var x := tile_index.y
+		var y := tile_index.z
+		match type:
+			MapOverlay.SEAMARKS:
+				return "https://tiles.openseamap.org/seamark/%d/%d/%d.png" % [z, x, y]
+			MapOverlay.RAILWAYS:
+				return "https://tiles.openrailwaymap.org/standard/%d/%d/%d.png" % [z, x, y]
+		return ""
 
 
 class TileRequest extends RefCounted:
@@ -1072,15 +1177,27 @@ class Tile extends RefCounted:
 	
 	
 	func get_image() -> Image:
-		if not has_image(): return null
+		if not has_image():
+			return null
+		var format := img_format
+		if format == ImgFormat.AUTO:
+			if _img_data.size() >= 8 and _img_data[0] == 0x89 and _img_data[1] == 0x50:
+				format = ImgFormat.PNG
+			elif _img_data.size() >= 3 and _img_data[0] == 0xff and _img_data[1] == 0xd8:
+				format = ImgFormat.JPG
+			elif _img_data.size() >= 4 and _img_data[0] == 0x52 and _img_data[1] == 0x49:
+				format = ImgFormat.WEBP
+			else:
+				return null
 		var img := Image.new()
-		match img_format:
-			ImgFormat.BMP: img.load_bmp_from_buffer(_img_data)
-			ImgFormat.JPG: img.load_jpg_from_buffer(_img_data)
-			ImgFormat.PNG: img.load_png_from_buffer(_img_data)
-			ImgFormat.TGA: img.load_tga_from_buffer(_img_data)
-			ImgFormat.WEBP: img.load_webp_from_buffer(_img_data)
-		return img
+		var error := ERR_FILE_UNRECOGNIZED
+		match format:
+			ImgFormat.BMP: error = img.load_bmp_from_buffer(_img_data)
+			ImgFormat.JPG: error = img.load_jpg_from_buffer(_img_data)
+			ImgFormat.PNG: error = img.load_png_from_buffer(_img_data)
+			ImgFormat.TGA: error = img.load_tga_from_buffer(_img_data)
+			ImgFormat.WEBP: error = img.load_webp_from_buffer(_img_data)
+		return img if error == OK else null
 
 
 	func get_texture() -> Texture2D:
@@ -1178,15 +1295,12 @@ class TileCache extends RefCounted:
 		return tiles
 
 
-	func find_least_recently_used(
-		protected_source_id: StringName,
-		protected_indices: Dictionary,
-	) -> TileCacheEntry:
+	func find_least_recently_used(protected_sources: Dictionary) -> TileCacheEntry:
 		var oldest: TileCacheEntry
 		for source_id: StringName in _tiles_by_source:
 			var source_tiles: Dictionary = _tiles_by_source[source_id]
 			for tile_index: Vector3i in source_tiles:
-				if source_id == protected_source_id and protected_indices.has(tile_index):
+				if protected_sources.has(source_id) and protected_sources[source_id].has(tile_index):
 					continue
 				var entry: TileCacheEntry = source_tiles[tile_index]
 				if oldest == null or entry.last_used < oldest.last_used:
@@ -1206,7 +1320,7 @@ class TileCache extends RefCounted:
 class TileLoader extends Node:
 	signal queue_drained
 
-	var user_agent: String = "Mozilla/5.0 Gecko/20100101 Firefox/118.0"
+	var user_agent: String = "DavidMaps/1.0"
 	var allow_network: bool = true
 	var concurrent_requests: int = 8:
 		set(value):
