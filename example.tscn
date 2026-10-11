@@ -1,21 +1,36 @@
-[gd_scene load_steps=2 format=3 uid="uid://bkq1inxbci5u"]
+[gd_scene format=3 uid="uid://bkq1inxbci5u"]
 
 [ext_resource type="Script" uid="uid://dbfed6elyysgg" path="res://addons/DavidMaps/DavidMaps.gd" id="1_2jas5"]
 
-[node name="example" type="PanelContainer"]
+[node name="example" type="PanelContainer" unique_id=276873788]
 anchors_preset = 15
 anchor_right = 1.0
 anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
 
-[node name="HSplitContainer" type="HSplitContainer" parent="."]
+[node name="HSplitContainer" type="HSplitContainer" parent="." unique_id=1510104323]
 layout_mode = 2
 
-[node name="PanelContainer" type="PanelContainer" parent="HSplitContainer"]
+[node name="PanelContainer" type="PanelContainer" parent="HSplitContainer" unique_id=618806796]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_stretch_ratio = 0.25
+
+[node name="ScrollContainer" type="ScrollContainer" parent="HSplitContainer/PanelContainer" unique_id=464837267]
+layout_mode = 2
+horizontal_scroll_mode = 0
+
+[node name="VBoxContainer" type="VBoxContainer" parent="HSplitContainer/PanelContainer/ScrollContainer" unique_id=549347117]
 layout_mode = 2
 
-[node name="DavidMaps" type="PanelContainer" parent="HSplitContainer"]
+[node name="Label" type="Label" parent="HSplitContainer/PanelContainer/ScrollContainer/VBoxContainer" unique_id=1143106256]
 layout_mode = 2
+text = "Info"
+
+[node name="DavidMaps" type="PanelContainer" parent="HSplitContainer" unique_id=1420971938]
+layout_mode = 2
+size_flags_horizontal = 3
 script = ExtResource("1_2jas5")
+provider_type = 4
 metadata/_custom_type_script = "uid://dbfed6elyysgg"
