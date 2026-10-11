@@ -129,9 +129,9 @@ func setup_nodes() -> void:
 func _gui_input(event: InputEvent) -> void:
 	if not event is InputEventMouse: return
 	if event is InputEventMouseMotion:
-		var dragging: bool = Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
+		var dragging: bool = (event.button_mask & MOUSE_BUTTON_MASK_MIDDLE) != 0
 		if dragging:
-			map_center_coord += _screen_to_tilef(event.relative, _current_zoom)
+			_pan_by_screen_delta(event.relative)
 			update()
 	
 	if event is InputEventMouseButton:
@@ -141,6 +141,19 @@ func _gui_input(event: InputEvent) -> void:
 			elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
 				_target_zoom = clampi(_target_zoom - 1, _provider.min_zoom, _provider.max_zoom)
 			update()
+
+
+func _pan_by_screen_delta(screen_delta: Vector2) -> void:
+	# Convert the drag at the zoom currently used to render the map. One tile is
+	# always tile_size pixels, while its geographic span halves at every zoom.
+	var zoom := float(_target_zoom)
+	var center_f := _coord_to_tilef(map_center_coord, zoom)
+	center_f -= screen_delta / _provider.tile_size
+
+	var world_tile_count := pow(2.0, zoom)
+	center_f.x = fposmod(center_f.x, world_tile_count)
+	center_f.y = clampf(center_f.y, 0.0, world_tile_count)
+	map_center_coord = _tilef_to_coord(center_f, zoom)
 
 
 var _tw_zoom: Tween
@@ -364,6 +377,13 @@ func _coord_to_tilef(coord: Vector2, zoom: float) -> Vector2:
 	var x = (coord.x + 180.0) / 360.0 * n
 	var y = (1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / PI) / 2.0 * n
 	return Vector2(x, y)
+
+
+func _tilef_to_coord(tile_coord: Vector2, zoom: float) -> Vector2:
+	var n := pow(2.0, zoom)
+	var longitude := tile_coord.x / n * 360.0 - 180.0
+	var latitude := rad_to_deg(atan(sinh(PI * (1.0 - 2.0 * tile_coord.y / n))))
+	return Vector2(longitude, latitude)
 
 
 func get_current_zoom_tilef_scale() -> float:
