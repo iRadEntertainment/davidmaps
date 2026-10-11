@@ -37,7 +37,7 @@ enum ImgFormat {JPG, PNG, BMP, WEBP, TGA}
 @export var show_attribution: bool = true
 @export var map_style: MapStyle = MapStyle.STREET
 @export var yandex_layer: YandexLayer = YandexLayer.MAP
-@export_range(0, 19, 1) var start_zoom: int = 10
+@export_range(0.0, 19.0, 0.01) var start_zoom: float = 10.0
 @export var start_longitude: float = 14.998
 @export var start_latitude: float = 40.897
 @export_enum("en", "it", "es", "fr", "ru", "de")
@@ -53,9 +53,12 @@ var cont_tile_renderer: Control
 var tile_canvas: Control
 
 var map_center_coord: Vector2
-var _target_zoom: int = 0
+var _target_zoom: float = 0.0
+var _rendered_tile_zoom: int = -1
+var _last_rendered_tile_zoom: int = -1
 var _loaded_tiles: Dictionary[TileKey, Tile] = {}
 var _visible_tiles: Dictionary[TileKey, Tile] = {}
+var _previous_rendered_tiles: Dictionary[TileKey, Tile] = {}
 var _tile_keys_by_index: Dictionary[Vector3i, TileKey] = {}
 
 
@@ -74,7 +77,7 @@ func _ready() -> void:
 func setup() -> void:
 	map_center_coord = Vector2(start_longitude, start_latitude)
 	_provider = Provider.new(provider_type, map_style, language_code, yandex_api_key, yandex_layer)
-	_target_zoom = clampi(start_zoom, _provider.min_zoom, _provider.max_zoom)
+	_target_zoom = clampf(start_zoom, _provider.min_zoom, _provider.max_zoom)
 	var provider_error := _provider.get_configuration_error()
 	if not provider_error.is_empty():
 		push_warning(provider_error)
@@ -131,31 +134,67 @@ func _gui_input(event: InputEvent) -> void:
 	if not event is InputEventMouseButton or not event.is_pressed():
 		return
 
-	if event.button_index == MOUSE_BUTTON_WHEEL_UP:
-		set_zoom_level(_target_zoom + 1)
-	elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
-		set_zoom_level(_target_zoom - 1)
+	var mouse_button_event: InputEventMouseButton = event
+	var zoom_anchor: Vector2 = mouse_button_event.position - cont_tile_renderer.position
+	if mouse_button_event.button_index == MOUSE_BUTTON_WHEEL_UP:
+		_set_zoom_level_at_screen_position(_target_zoom + 0.2, zoom_anchor)
+	elif mouse_button_event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+		_set_zoom_level_at_screen_position(_target_zoom - 0.2, zoom_anchor)
 
 
 func _pan_by_screen_delta(screen_delta: Vector2) -> void:
-	# Convert the drag at the zoom currently used to render the map. One tile is
-	# always tile_size pixels, while its geographic span halves at every zoom.
-	var zoom := float(_target_zoom)
-	var center_f := _coord_to_tilef(map_center_coord, zoom)
-	center_f -= screen_delta / _provider.tile_size
+	var tile_zoom := _get_tile_zoom_level()
+	var display_tile_size := _get_display_tile_size(tile_zoom)
+	var center_f := _coord_to_tilef(map_center_coord, tile_zoom)
+	center_f -= screen_delta / display_tile_size
 
-	var world_tile_count := pow(2.0, zoom)
+	var world_tile_count := pow(2.0, tile_zoom)
 	center_f.x = fposmod(center_f.x, world_tile_count)
 	center_f.y = clampf(center_f.y, 0.0, world_tile_count)
-	map_center_coord = _tilef_to_coord(center_f, zoom)
+	map_center_coord = _tilef_to_coord(center_f, tile_zoom)
 
 
-func set_zoom_level(new_zoom_level: int) -> void:
-	var clamped_zoom := clampi(new_zoom_level, _provider.min_zoom, _provider.max_zoom)
-	if clamped_zoom == _target_zoom:
+func set_zoom_level(new_zoom_level: float) -> void:
+	var clamped_zoom := clampf(new_zoom_level, _provider.min_zoom, _provider.max_zoom)
+	if is_equal_approx(clamped_zoom, _target_zoom):
 		return
 	_target_zoom = clamped_zoom
 	update()
+
+
+func _set_zoom_level_at_screen_position(new_zoom_level: float, screen_position: Vector2) -> void:
+	var clamped_zoom := clampf(new_zoom_level, _provider.min_zoom, _provider.max_zoom)
+	if is_equal_approx(clamped_zoom, _target_zoom):
+		return
+
+	var old_tile_zoom := _get_tile_zoom_level()
+	var old_display_tile_size := _get_display_tile_size(old_tile_zoom)
+	var anchor_tile_f := _screen_to_tilef(screen_position, old_tile_zoom, old_display_tile_size)
+	var anchor_coord := _tilef_to_coord(anchor_tile_f, old_tile_zoom)
+
+	_target_zoom = clamped_zoom
+
+	var new_tile_zoom := _get_tile_zoom_level()
+	var new_display_tile_size := _get_display_tile_size(new_tile_zoom)
+	var new_anchor_tile_f := _coord_to_tilef(anchor_coord, new_tile_zoom)
+	var screen_offset_tiles := (
+		(screen_position - cont_tile_renderer.size / 2.0) / new_display_tile_size
+	)
+	var new_center_f := new_anchor_tile_f - screen_offset_tiles
+	var world_tile_count := pow(2.0, new_tile_zoom)
+	new_center_f.x = fposmod(new_center_f.x, world_tile_count)
+	new_center_f.y = clampf(new_center_f.y, 0.0, world_tile_count)
+	map_center_coord = _tilef_to_coord(new_center_f, new_tile_zoom)
+	update()
+
+
+func _get_tile_zoom_level() -> int:
+	return clampi(ceili(_target_zoom), _provider.min_zoom, _provider.max_zoom)
+
+
+func _get_display_tile_size(tile_zoom: int) -> Vector2:
+	var scale := pow(2.0, _target_zoom - tile_zoom)
+	return _provider.tile_size * scale
 
 
 #region Renderer
@@ -171,39 +210,12 @@ func _queue_renderer_redraw() -> void:
 
 
 func _draw_renderer() -> void:
-	var center_f: Vector2 = _coord_to_tilef(map_center_coord, _target_zoom)
-	var n: int = 1 << _target_zoom
+	var tile_zoom := _get_tile_zoom_level()
 	var renderer_size := cont_tile_renderer.size
-	var center_screen := renderer_size / 2.0
-	var tile_rect := _get_tile_grid_rect(center_f, renderer_size)
+	if _last_rendered_tile_zoom >= 0 and _last_rendered_tile_zoom != tile_zoom:
+		_draw_tile_layer(_last_rendered_tile_zoom, renderer_size, false)
+	_draw_tile_layer(tile_zoom, renderer_size, true)
 
-	for y_un in range(tile_rect.position.y, tile_rect.end.y):
-		if y_un < 0 or y_un >= n:
-			continue
-
-		for x_un in range(tile_rect.position.x, tile_rect.end.x):
-			var x_wr: int = ((x_un % n) + n) % n
-
-			var tile_index := Vector3i(_target_zoom, x_wr, y_un) # (z,x,y)
-			var key: TileKey = _tile_keys_by_index.get(tile_index)
-			if key == null:
-				continue
-
-			var tile: Tile = _visible_tiles.get(key)
-			if tile == null:
-				continue
-
-			var tex: Texture2D = tile.get_texture()
-			if tex == null:
-				continue
-
-			var base_pos := center_screen + Vector2(
-				(x_un - center_f.x) * _provider.tile_size.x,
-				(y_un - center_f.y) * _provider.tile_size.y
-			)
-
-			_draw_tex_if_visible(tex, base_pos, renderer_size)
-	
 	# debug
 	if debug_view_on:
 		var m_pos: Vector2 = get_global_mouse_position()
@@ -212,34 +224,75 @@ func _draw_renderer() -> void:
 	_draw_attribution()
 
 
+func _draw_tile_layer(tile_zoom: int, renderer_size: Vector2, current_layer: bool) -> void:
+	var display_tile_size := _get_display_tile_size(tile_zoom)
+	var center_f: Vector2 = _coord_to_tilef(map_center_coord, tile_zoom)
+	var n: int = 1 << tile_zoom
+	var center_screen := renderer_size / 2.0
+	var tile_rect := _get_tile_grid_rect(center_f, renderer_size, display_tile_size)
+
+	for y_un in range(tile_rect.position.y, tile_rect.end.y):
+		if y_un < 0 or y_un >= n:
+			continue
+
+		for x_un in range(tile_rect.position.x, tile_rect.end.x):
+			var x_wr: int = ((x_un % n) + n) % n
+
+			var tile_index := Vector3i(tile_zoom, x_wr, y_un) # (z,x,y)
+			var key: TileKey = _tile_keys_by_index.get(tile_index)
+			if key == null:
+				continue
+
+			var tile: Tile
+			if current_layer:
+				tile = _visible_tiles.get(key)
+			else:
+				tile = _previous_rendered_tiles.get(key)
+			if tile == null:
+				continue
+
+			var tex: Texture2D = tile.get_texture()
+			if tex == null:
+				continue
+
+			var base_pos := center_screen + Vector2(
+				(x_un - center_f.x) * display_tile_size.x,
+				(y_un - center_f.y) * display_tile_size.y
+			)
+
+			_draw_tex_if_visible(tex, base_pos, display_tile_size, renderer_size)
+
+
 func _draw_renderer_debug(mouse_pos: Vector2) -> void:
-	# Mouse → float tile coords
-	var tf := _screen_to_tilef(mouse_pos, _target_zoom)
+	var tile_zoom := _get_tile_zoom_level()
+	var display_tile_size := _get_display_tile_size(tile_zoom)
+	# Mouse -> float tile coords at the requested integer zoom.
+	var tf := _screen_to_tilef(mouse_pos, tile_zoom, display_tile_size)
 	var tile_x_unwrapped := int(floor(tf.x))
 	var tile_y_unwrapped := int(floor(tf.y))
 
 	# Indices for fetching/label (wrap X, clamp Y)
-	var n: int = int(pow(2.0, _target_zoom))
+	var n: int = 1 << tile_zoom
 	var tile_x: int = ((tile_x_unwrapped % n) + n) % n
 	var tile_y: int = clampi(tile_y_unwrapped, 0, n - 1)
 
 	# Where to draw the outline (use UNWRAPPED indices so the box is exactly under the mouse)
-	var center_f: Vector2 = _coord_to_tilef(map_center_coord, _target_zoom)
+	var center_f: Vector2 = _coord_to_tilef(map_center_coord, tile_zoom)
 	var top_left: Vector2 = (cont_tile_renderer.size / 2.0) + Vector2(
 		(tile_x_unwrapped - center_f.x),
 		(tile_y_unwrapped - center_f.y)
-	) * _provider.tile_size
-	var r := Rect2(top_left, _provider.tile_size)
+	) * display_tile_size
+	var r := Rect2(top_left, display_tile_size)
 
 	# Draw: outline + center label
 	tile_canvas.draw_rect(r, Color(1, 0.3, 0.1, 1.0), false, 2.0)  # outline
 
 	var font := get_theme_default_font()
 	var font_size := get_theme_default_font_size()
-	var label := str(Vector3i(_target_zoom, tile_x, tile_y))  # "(z, x, y)"
+	var label := str(Vector3i(tile_zoom, tile_x, tile_y))  # "(z, x, y)"
 	var text_size := font.get_string_size(label, font_size)
 	# center text in the tile
-	var text_pos := top_left + _provider.tile_size * 0.5 - text_size * 0.5
+	var text_pos := top_left + display_tile_size * 0.5 - text_size * 0.5
 	# nudge down a bit to account for ascent
 	text_pos.y += font.get_ascent(font_size) * 0.5
 	tile_canvas.draw_string(font, text_pos, label, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, Color(1,1,1,0.95))
@@ -249,12 +302,17 @@ func _draw_renderer_debug(mouse_pos: Vector2) -> void:
 	tile_canvas.draw_line(mouse_pos + Vector2(0, -6), mouse_pos + Vector2(0, 6), Color(1,1,1,0.5), 1.0)
 
 
-func _draw_tex_if_visible(tex: Texture2D, pos: Vector2, renderer_size: Vector2) -> void:
+func _draw_tex_if_visible(
+	tex: Texture2D,
+	pos: Vector2,
+	display_tile_size: Vector2,
+	renderer_size: Vector2,
+) -> void:
 	# quick cull so we don't overdraw offscreen
-	var r := Rect2(pos, _provider.tile_size)
+	var r := Rect2(pos, display_tile_size)
 	if r.end.x <= 0 or r.position.x >= renderer_size.x or r.end.y <= 0 or r.position.y >= renderer_size.y:
 		return
-	tile_canvas.draw_texture(tex, pos)
+	tile_canvas.draw_texture_rect(tex, r, false)
 
 
 func _draw_attribution() -> void:
@@ -278,10 +336,13 @@ func _draw_attribution() -> void:
 #region Tiles Requests
 func _request_visible_tiles() -> void:
 	_visible_tiles.clear()
-	
-	var center_f := _coord_to_tilef(map_center_coord, _target_zoom)
-	var n := 1 << _target_zoom
-	var tile_rect := _get_tile_grid_rect(center_f, cont_tile_renderer.size)
+
+	var tile_zoom := _get_tile_zoom_level()
+	_track_rendered_tile_zoom(tile_zoom)
+	var display_tile_size := _get_display_tile_size(tile_zoom)
+	var center_f := _coord_to_tilef(map_center_coord, tile_zoom)
+	var n := 1 << tile_zoom
+	var tile_rect := _get_tile_grid_rect(center_f, cont_tile_renderer.size, display_tile_size)
 
 	for y_un in range(tile_rect.position.y, tile_rect.end.y):
 		if y_un < 0 or y_un >= n:
@@ -289,7 +350,7 @@ func _request_visible_tiles() -> void:
 
 		for x_un in range(tile_rect.position.x, tile_rect.end.x):
 			var x_wr := ((x_un % n) + n) % n
-			var tile_index := Vector3i(_target_zoom, x_wr, y_un)  # (z,x,y)
+			var tile_index := Vector3i(tile_zoom, x_wr, y_un)  # (z,x,y)
 
 			var key := _get_or_create_tile_key(tile_index)
 			if _visible_tiles.has(key):
@@ -305,6 +366,31 @@ func _request_visible_tiles() -> void:
 			tile.request_image(tile_loader, _provider.url_from_index(tile_index))
 
 
+func _track_rendered_tile_zoom(tile_zoom: int) -> void:
+	if tile_zoom == _rendered_tile_zoom:
+		return
+
+	var loaded_snapshot: Dictionary[TileKey, Tile] = {}
+	if _rendered_tile_zoom >= 0:
+		for key in _loaded_tiles:
+			var tile: Tile = _loaded_tiles[key]
+			if tile.index.x == _rendered_tile_zoom and tile.has_image():
+				loaded_snapshot[key] = tile
+
+	if not loaded_snapshot.is_empty():
+		_previous_rendered_tiles = loaded_snapshot
+		_last_rendered_tile_zoom = _rendered_tile_zoom
+
+	_cancel_obsolete_tile_requests(tile_zoom)
+	_rendered_tile_zoom = tile_zoom
+
+
+func _cancel_obsolete_tile_requests(current_tile_zoom: int) -> void:
+	for tile in _loaded_tiles.values():
+		if tile.index.x != current_tile_zoom:
+			tile.cancel_image_request(tile_loader)
+
+
 func _get_or_create_tile_key(tile_index: Vector3i) -> TileKey:
 	var key: TileKey = _tile_keys_by_index.get(tile_index)
 	if key == null:
@@ -316,9 +402,10 @@ func _get_or_create_tile_key(tile_index: Vector3i) -> TileKey:
 func _get_tile_grid_rect(
 	center_f: Vector2,
 	renderer_size: Vector2,
+	display_tile_size: Vector2,
 	prefetch_padding: int = 1,
 ) -> Rect2i:
-	var half_span := renderer_size / _provider.tile_size / 2.0
+	var half_span := renderer_size / display_tile_size / 2.0
 	var first := Vector2i(
 		floori(center_f.x - half_span.x) - prefetch_padding,
 		floori(center_f.y - half_span.y) - prefetch_padding,
@@ -332,10 +419,10 @@ func _get_tile_grid_rect(
 
 
 #region Canvas/Tile Coord
-# Convert a pixel in renderer local coords to float tile coords
-func _screen_to_tilef(pix: Vector2, zoom: float) -> Vector2:
-	var center_f := _coord_to_tilef(map_center_coord, zoom)
-	var delta_tiles := (pix - (cont_tile_renderer.size / 2.0)) / _provider.tile_size
+# Convert a pixel in renderer local coords to float tile coords.
+func _screen_to_tilef(pix: Vector2, tile_zoom: int, display_tile_size: Vector2) -> Vector2:
+	var center_f := _coord_to_tilef(map_center_coord, tile_zoom)
+	var delta_tiles := (pix - (cont_tile_renderer.size / 2.0)) / display_tile_size
 	return center_f + delta_tiles
 
 
@@ -511,6 +598,7 @@ class TileRequest extends RefCounted:
 
 	var url: String
 	var custom_headers: PackedStringArray
+	var cancelled: bool = false
 
 
 	func _init(_url: String, _custom_headers: PackedStringArray) -> void:
@@ -564,6 +652,12 @@ class Tile extends RefCounted:
 			image_updated.emit()
 
 		request_completed.emit(result, response_code)
+
+
+	func cancel_image_request(loader: TileLoader) -> bool:
+		if loader == null or _pending_request == null:
+			return false
+		return loader.cancel_request(_pending_request)
 	
 	
 	func get_image() -> Image:
@@ -623,6 +717,27 @@ class TileLoader extends Node:
 
 	func get_active_request_count() -> int:
 		return _active_requests.size()
+
+
+	func cancel_request(pending: TileRequest) -> bool:
+		if pending == null or pending.cancelled:
+			return false
+
+		var queued_index := _request_queue.find(pending)
+		if queued_index >= 0:
+			_request_queue.remove_at(queued_index)
+			_complete_cancelled_request(pending)
+			return true
+
+		for worker in _active_requests:
+			if _active_requests[worker] != pending:
+				continue
+			_active_requests.erase(worker)
+			worker.cancel_request()
+			_complete_cancelled_request(pending)
+			return true
+
+		return false
 
 
 	func _schedule_pump() -> void:
@@ -697,6 +812,21 @@ class TileLoader extends Node:
 			return
 		_active_requests.erase(worker)
 		pending.completed.emit(result, response_code, response_headers, body)
+		_continue_or_finish_queue()
+
+
+	func _complete_cancelled_request(pending: TileRequest) -> void:
+		pending.cancelled = true
+		pending.completed.emit(
+			HTTPRequest.RESULT_REQUEST_FAILED,
+			0,
+			PackedStringArray(),
+			PackedByteArray(),
+		)
+		_continue_or_finish_queue()
+
+
+	func _continue_or_finish_queue() -> void:
 		if _request_queue.is_empty() and _active_requests.is_empty():
 			queue_drained.emit()
 		else:
