@@ -6,20 +6,17 @@ class_name DavidMaps
 #region Enums
 enum ProviderType {
 	OSM,
+	WORLD_IMAGERY,
+	TERRARIUM,
 	BING,
 	YANDEX,
-	TERRARIUM,
-	WORLD_IMAGERY,
 }
 
-enum MapStyle {
+enum MapLayer {
+	ROAD,
 	SATELLITE,
-	STREET,
 	HYBRID,
-}
-
-enum YandexLayer {
-	MAP,
+	TERRAIN,
 	FUTURE_MAP,
 	DRIVING,
 	TRANSIT,
@@ -29,26 +26,42 @@ enum YandexLayer {
 enum ImgFormat {JPG, PNG, BMP, WEBP, TGA}
 #endregion
 
+#region Signals
+signal map_mouse_event(event: InputEventMouse, lat: float, lon: float)
+signal view_changed(zoom: float, lat: float, lon: float)
+signal navigation_finished
+signal drag_started
+signal drag_ended
+signal provider_changed(provider: ProviderType)
+signal layer_changed(layer: MapLayer)
+#endregion
+
 @export var debug_view_on: bool = true
 @export var provider_type: ProviderType = ProviderType.OSM:
 	set(value):
 		provider_type = value
+		# Keep the initial inspector layer valid when the provider is changed.
+		var supported: Array = Provider.layers_for_type(value)
+		if not supported.has(map_layer):
+			map_layer = supported.front()
 		notify_property_list_changed()
 @export var show_attribution: bool = true
-@export var map_style: MapStyle = MapStyle.STREET
-@export var yandex_layer: YandexLayer = YandexLayer.MAP
+@export var map_layer: int = MapLayer.ROAD
 @export_range(0.0, 19.0, 0.01) var start_zoom: float = 10.0
 @export var start_longitude: float = 14.998
 @export var start_latitude: float = 40.897
 @export_enum("en", "it", "es", "fr", "ru", "de")
 var language_code: String = "en"
+@export_group("Navigation")
+@export_range(0.05, 5.0, 0.05, "suffix:s") var navigation_duration: float = 0.45
+@export var interaction_enabled: bool = true
+@export var pan_enabled: bool = true
+@export var zoom_enabled: bool = true
 @export_group("Provider Credentials")
 @export var yandex_api_key: String = ""
-@export_group("")
 @export_group("Tile Cache")
 @export_range(1, 1000, 1) var max_cached_tiles: int = 50
 @export_group("")
-
 
 var _provider: Provider
 var tile_loader: TileLoader
@@ -67,6 +80,10 @@ var _visible_tiles: Dictionary[Vector3i, Tile] = {}
 var _previous_rendered_tiles: Dictionary[Vector3i, Tile] = {}
 var _debug_mouse_position: Vector2
 var _debug_mouse_inside: bool = false
+var _navigation_tween: Tween
+var _is_dragging: bool = false
+
+const MAX_MERCATOR_LATITUDE: float = 85.0511287798066
 
 
 
@@ -76,12 +93,14 @@ func _ready() -> void:
 		return
 
 	setup()
+	_sync_mouse_scroll_passthrough()
 	update()
 
 
 func setup() -> void:
-	map_center_coord = Vector2(start_longitude, start_latitude)
-	_provider = Provider.new(provider_type, map_style, language_code, yandex_api_key, yandex_layer)
+	map_center_coord = _sanitize_coord(Vector2(start_longitude, start_latitude))
+	_provider = Provider.new(provider_type, map_layer, language_code, yandex_api_key)
+	map_layer = _provider.layer
 	_target_zoom = clampf(start_zoom, _provider.min_zoom, _provider.max_zoom)
 	var provider_error := _provider.get_configuration_error()
 	if not provider_error.is_empty():
@@ -121,21 +140,239 @@ func _validate_property(property: Dictionary) -> void:
 	var property_name: StringName = property.name
 	var is_visible := true
 	match property_name:
-		&"map_style":
-			is_visible = provider_type == ProviderType.BING
-		&"yandex_layer", &"yandex_api_key":
+		&"map_layer":
+			# Dynamic inspector enum: only show the selected provider's layers.
+			var options := PackedStringArray()
+			for layer in Provider.layers_for_type(provider_type):
+				options.append("%s:%d" % [MapLayer.keys()[layer].capitalize(), layer])
+			property.hint = PROPERTY_HINT_ENUM
+			property.hint_string = ",".join(options)
+		&"yandex_api_key":
 			is_visible = provider_type == ProviderType.YANDEX
 		&"language_code":
 			is_visible = provider_type == ProviderType.BING or provider_type == ProviderType.YANDEX
-
 	if not is_visible:
 		property.usage = property.usage & ~PROPERTY_USAGE_EDITOR
 #endregion
 
 
+#region API
+# All lat/lon arguments are degrees; returned Vector2 values are (lon, lat).
+# Screen coordinates are LOCAL to this Control, including when placed inside
+# other Controls/Containers. The closest horizontal world copy is used.
+
+func go_to(zoom: float, lat: float, lon: float, tweened: bool = false) -> void:
+	var destination := _sanitize_coord(Vector2(lon, lat))
+	if _provider == null:
+		start_zoom = zoom
+		start_latitude = destination.y
+		start_longitude = destination.x
+		return
+
+	var target_zoom := clampf(zoom, _provider.min_zoom, _provider.max_zoom)
+	_cancel_navigation()
+	if not tweened or not is_inside_tree() or navigation_duration <= 0.0:
+		_apply_view(target_zoom, destination)
+		return
+
+	# Interpolate normalized Web Mercator coordinates instead of degrees.
+	# Unwrap X across the shortest antimeridian path.
+	var start_world := _coord_to_tilef(map_center_coord, 0.0)
+	var end_world := _coord_to_tilef(destination, 0.0)
+	var shortest_dx := fposmod(end_world.x - start_world.x + 0.5, 1.0) - 0.5
+	end_world.x = start_world.x + shortest_dx
+	var start_zoom_value := _target_zoom
+	if start_world.is_equal_approx(end_world) and is_equal_approx(start_zoom_value, target_zoom):
+		return
+
+	_navigation_tween = create_tween().set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_IN_OUT)
+	_navigation_tween.tween_method(
+		_animate_view.bind(start_world, end_world, start_zoom_value, target_zoom),
+		0.0, 1.0, navigation_duration
+	)
+	_navigation_tween.finished.connect(_on_navigation_finished)
+
+
+func pan_to(lat: float, lon: float, tweened: bool = false) -> void:
+	go_to(get_zoom_level(), lat, lon, tweened)
+
+
+func zoom_to(zoom: float, tweened: bool = false) -> void:
+	var center := get_center_coord()
+	go_to(zoom, center.y, center.x, tweened)
+
+
+# Legacy entry point from the original widget.
+func set_zoom_level(new_zoom_level: float) -> void:
+	zoom_to(new_zoom_level)
+
+
+func get_zoom_level() -> float:
+	return _target_zoom if _provider != null else start_zoom
+
+
+func get_center_coord() -> Vector2:
+	return map_center_coord if _provider != null else Vector2(start_longitude, start_latitude)
+
+
+func screen_to_coord(local_position: Vector2) -> Vector2:
+	if _provider == null or cont_tile_renderer == null:
+		return get_center_coord()
+	var tile_zoom := _get_tile_zoom_level()
+	var tile_pos := _screen_to_tilef(
+		local_position - cont_tile_renderer.position,
+		tile_zoom, _get_display_tile_size(tile_zoom)
+	)
+	return _sanitize_coord(_tilef_to_coord(tile_pos, tile_zoom))
+
+
+func coord_to_screen(lat: float, lon: float) -> Vector2:
+	if _provider == null or cont_tile_renderer == null:
+		return size / 2.0
+	var tile_zoom := _get_tile_zoom_level()
+	var center_tiles := _coord_to_tilef(map_center_coord, tile_zoom)
+	var point_tiles := _coord_to_tilef(_sanitize_coord(Vector2(lon, lat)), tile_zoom)
+	var n := pow(2.0, tile_zoom)
+	var delta := point_tiles - center_tiles
+	delta.x = fposmod(delta.x + n * 0.5, n) - n * 0.5
+	return cont_tile_renderer.position + cont_tile_renderer.size / 2.0 + delta * _get_display_tile_size(tile_zoom)
+
+
+# west_lon > east_lon denotes bounds crossing the antimeridian.
+# padding_px is applied on every side. Widget must have a nonzero size.
+func fit_bounds(
+	south_lat: float, west_lon: float, north_lat: float, east_lon: float,
+	tweened: bool = false, padding_px: float = 24.0,
+) -> void:
+	if _provider == null or cont_tile_renderer == null:
+		return
+	var view_size := cont_tile_renderer.size - Vector2.ONE * maxf(0.0, padding_px) * 2.0
+	if view_size.x <= 0.0 or view_size.y <= 0.0:
+		push_warning("fit_bounds() needs a sized DavidMaps Control with space for its padding.")
+		return
+
+	var south := clampf(minf(south_lat, north_lat), -MAX_MERCATOR_LATITUDE, MAX_MERCATOR_LATITUDE)
+	var north := clampf(maxf(south_lat, north_lat), -MAX_MERCATOR_LATITUDE, MAX_MERCATOR_LATITUDE)
+	var west := wrapf(west_lon, -180.0, 180.0)
+	var east := wrapf(east_lon, -180.0, 180.0)
+	# Keep the full-world case distinct from a zero-width meridian.
+	var x_span := 1.0 if absf(east_lon - west_lon) >= 360.0 else fposmod(east - west, 360.0) / 360.0
+	var north_y := _coord_to_tilef(Vector2(0.0, north), 0.0).y
+	var south_y := _coord_to_tilef(Vector2(0.0, south), 0.0).y
+	var y_span := south_y - north_y
+
+	var target_zoom := float(_provider.max_zoom)
+	if x_span > 0.0:
+		target_zoom = minf(target_zoom, log(view_size.x / (_provider.tile_size.x * x_span)) / log(2.0))
+	if y_span > 0.0:
+		target_zoom = minf(target_zoom, log(view_size.y / (_provider.tile_size.y * y_span)) / log(2.0))
+
+	var center_world := Vector2(
+		fposmod((west + 180.0) / 360.0 + x_span * 0.5, 1.0),
+		(north_y + south_y) * 0.5
+	)
+	var center := _tilef_to_coord(center_world, 0.0)
+	go_to(target_zoom, center.y, center.x, tweened)
+
+
+func get_provider() -> ProviderType:
+	return _provider.type if _provider != null else provider_type
+
+
+func get_layer() -> MapLayer:
+	return _provider.layer if _provider != null else map_layer
+
+
+# Array contains typed MapLayer values (e.g. MapLayer.ROAD).
+func get_available_layers() -> Array[MapLayer]:
+	if _provider == null:
+		return Provider.layers_for_type(provider_type)
+	# Return a copy, so external callers cannot change the provider's metadata.
+	var layers: Array[MapLayer] = []
+	layers.assign(_provider.available_layers)
+	return layers
+
+
+func get_layers_for_provider(type: ProviderType) -> Array[MapLayer]:
+	return Provider.layers_for_type(type)
+
+
+# Picks a supported layer if the new provider cannot serve the old one.
+# Rebuilds the provider so the cache/request source ID is updated.
+func set_provider(type: ProviderType) -> void:
+	var old_type := get_provider()
+	var old_layer := get_layer()
+	provider_type = type
+	if _provider == null:
+		return
+	_cancel_navigation()
+	_provider = Provider.new(provider_type, map_layer, language_code, yandex_api_key)
+	map_layer = _provider.layer
+	var configuration_error := _provider.get_configuration_error()
+	if not configuration_error.is_empty():
+		push_warning(configuration_error)
+	var clamped_zoom := clampf(_target_zoom, _provider.min_zoom, _provider.max_zoom)
+	if not is_equal_approx(clamped_zoom, _target_zoom):
+		_apply_view(clamped_zoom, map_center_coord)
+	else:
+		update()  # The source changed, even if camera coordinates did not.
+	if old_type != type:
+		provider_changed.emit(type)
+	if old_layer != map_layer:
+		layer_changed.emit(map_layer)
+
+
+# Returns false (without changing anything) when the provider lacks the layer.
+func set_layer(layer: MapLayer) -> bool:
+	if not get_available_layers().has(layer):
+		return false
+	if get_layer() == layer:
+		return true
+	map_layer = layer
+	if _provider != null:
+		_cancel_navigation()
+		_provider = Provider.new(provider_type, map_layer, language_code, yandex_api_key)
+		update()
+		layer_changed.emit(layer)
+	return true
+
+
+# These flags govern built-in gestures, NOT map_mouse_event delivery.
+func set_interaction_enabled(enabled: bool) -> void:
+	interaction_enabled = enabled
+	_sync_mouse_scroll_passthrough()
+	if not enabled:
+		_end_drag()
+
+
+func set_pan_enabled(enabled: bool) -> void:
+	pan_enabled = enabled
+	if not enabled:
+		_end_drag()
+
+
+func set_zoom_enabled(enabled: bool) -> void:
+	zoom_enabled = enabled
+	_sync_mouse_scroll_passthrough()
+
+#endregion
+
+
+#region Input
+func _sync_mouse_scroll_passthrough() -> void:
+	# While zooming, consume wheel events instead of scrolling an ancestor
+	# ScrollContainer. When disabled, let the parent handle wheel events.
+	mouse_force_pass_scroll_events = not (interaction_enabled and zoom_enabled)
+
+
 func _gui_input(event: InputEvent) -> void:
 	if not event is InputEventMouse:
 		return
+
+	# Convert using the camera state at the instant the event arrives.
+	var mouse_event: InputEventMouse = event
+	var world_coord := screen_to_coord(mouse_event.position)
+	map_mouse_event.emit(mouse_event, world_coord.y, world_coord.x)
 
 	if event is InputEventMouseMotion:
 		var event_canvas_position: Vector2 = get_global_transform_with_canvas() * event.position
@@ -148,21 +385,40 @@ func _gui_input(event: InputEvent) -> void:
 		)
 		cont_debug_renderer.queue_redraw()
 
-		var dragging: bool = (event.button_mask & MOUSE_BUTTON_MASK_MIDDLE) != 0
-		if dragging:
+		if _is_dragging and interaction_enabled and pan_enabled:
+			_cancel_navigation()
 			_pan_by_screen_delta(event.relative)
-			update()
 		return
 
-	if not event is InputEventMouseButton or not event.is_pressed():
+	if not event is InputEventMouseButton:
 		return
 
-	var mouse_button_event: InputEventMouseButton = event
-	var zoom_anchor: Vector2 = mouse_button_event.position - cont_tile_renderer.position
-	if mouse_button_event.button_index == MOUSE_BUTTON_WHEEL_UP:
+	var button_event: InputEventMouseButton = event
+	if button_event.button_index == MOUSE_BUTTON_MIDDLE:
+		if button_event.pressed and interaction_enabled and pan_enabled:
+			if not _is_dragging:
+				_cancel_navigation()
+				_is_dragging = true
+				drag_started.emit()
+		elif not button_event.pressed:
+			_end_drag()
+		return
+
+	if not button_event.pressed or not interaction_enabled or not zoom_enabled:
+		return
+	var zoom_anchor := button_event.position - cont_tile_renderer.position
+	if button_event.button_index == MOUSE_BUTTON_WHEEL_UP:
+		_cancel_navigation()
 		_set_zoom_level_at_screen_position(_target_zoom + 0.2, zoom_anchor)
-	elif mouse_button_event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+	elif button_event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+		_cancel_navigation()
 		_set_zoom_level_at_screen_position(_target_zoom - 0.2, zoom_anchor)
+
+
+func _end_drag() -> void:
+	if _is_dragging:
+		_is_dragging = false
+		drag_ended.emit()
 
 
 func _pan_by_screen_delta(screen_delta: Vector2) -> void:
@@ -170,19 +426,10 @@ func _pan_by_screen_delta(screen_delta: Vector2) -> void:
 	var display_tile_size := _get_display_tile_size(tile_zoom)
 	var center_f := _coord_to_tilef(map_center_coord, tile_zoom)
 	center_f -= screen_delta / display_tile_size
-
 	var world_tile_count := pow(2.0, tile_zoom)
 	center_f.x = fposmod(center_f.x, world_tile_count)
 	center_f.y = clampf(center_f.y, 0.0, world_tile_count)
-	map_center_coord = _tilef_to_coord(center_f, tile_zoom)
-
-
-func set_zoom_level(new_zoom_level: float) -> void:
-	var clamped_zoom := clampf(new_zoom_level, _provider.min_zoom, _provider.max_zoom)
-	if is_equal_approx(clamped_zoom, _target_zoom):
-		return
-	_target_zoom = clamped_zoom
-	update()
+	_apply_view(_target_zoom, _tilef_to_coord(center_f, tile_zoom))
 
 
 func _set_zoom_level_at_screen_position(new_zoom_level: float, screen_position: Vector2) -> void:
@@ -191,24 +438,57 @@ func _set_zoom_level_at_screen_position(new_zoom_level: float, screen_position: 
 		return
 
 	var old_tile_zoom := _get_tile_zoom_level()
-	var old_display_tile_size := _get_display_tile_size(old_tile_zoom)
-	var anchor_tile_f := _screen_to_tilef(screen_position, old_tile_zoom, old_display_tile_size)
+	var anchor_tile_f := _screen_to_tilef(screen_position, old_tile_zoom, _get_display_tile_size(old_tile_zoom))
 	var anchor_coord := _tilef_to_coord(anchor_tile_f, old_tile_zoom)
-
-	_target_zoom = clamped_zoom
-
-	var new_tile_zoom := _get_tile_zoom_level()
-	var new_display_tile_size := _get_display_tile_size(new_tile_zoom)
+	var new_tile_zoom := clampi(ceili(clamped_zoom), _provider.min_zoom, _provider.max_zoom)
+	var new_display_tile_size := _provider.tile_size * pow(2.0, clamped_zoom - new_tile_zoom)
 	var new_anchor_tile_f := _coord_to_tilef(anchor_coord, new_tile_zoom)
-	var screen_offset_tiles := (
-		(screen_position - cont_tile_renderer.size / 2.0) / new_display_tile_size
-	)
+	var screen_offset_tiles := (screen_position - cont_tile_renderer.size / 2.0) / new_display_tile_size
 	var new_center_f := new_anchor_tile_f - screen_offset_tiles
 	var world_tile_count := pow(2.0, new_tile_zoom)
 	new_center_f.x = fposmod(new_center_f.x, world_tile_count)
 	new_center_f.y = clampf(new_center_f.y, 0.0, world_tile_count)
-	map_center_coord = _tilef_to_coord(new_center_f, new_tile_zoom)
+	_apply_view(clamped_zoom, _tilef_to_coord(new_center_f, new_tile_zoom))
+
+
+func _cancel_navigation() -> void:
+	if _navigation_tween != null:
+		_navigation_tween.kill()
+		_navigation_tween = null
+
+
+func _animate_view(
+	progress: float, start_world: Vector2, end_world: Vector2,
+	from_zoom: float, to_zoom: float,
+) -> void:
+	var world := start_world.lerp(end_world, progress)
+	var center := _tilef_to_coord(world, 0.0)
+	_apply_view(lerpf(from_zoom, to_zoom, progress), center)
+
+
+func _on_navigation_finished() -> void:
+	_navigation_tween = null
+	navigation_finished.emit()
+
+
+func _apply_view(zoom: float, coord: Vector2) -> void:
+	if _provider == null:
+		return
+	var next_zoom := clampf(zoom, _provider.min_zoom, _provider.max_zoom)
+	var next_center := _sanitize_coord(coord)
+	if is_equal_approx(_target_zoom, next_zoom) and map_center_coord.is_equal_approx(next_center):
+		return
+	_target_zoom = next_zoom
+	map_center_coord = next_center
 	update()
+	view_changed.emit(_target_zoom, map_center_coord.y, map_center_coord.x)
+
+
+func _sanitize_coord(coord: Vector2) -> Vector2:
+	return Vector2(
+		wrapf(coord.x, -180.0, 180.0),
+		clampf(coord.y, -MAX_MERCATOR_LATITUDE, MAX_MERCATOR_LATITUDE)
+	)
 
 
 func _get_tile_zoom_level() -> int:
@@ -218,6 +498,7 @@ func _get_tile_zoom_level() -> int:
 func _get_display_tile_size(tile_zoom: int) -> Vector2:
 	var scale := pow(2.0, _target_zoom - tile_zoom)
 	return _provider.tile_size * scale
+#endregion
 
 
 #region Renderer
@@ -490,7 +771,11 @@ func _get_tile_grid_rect(
 
 #region Canvas/Tile Coord
 # Convert a pixel in renderer local coords to float tile coords.
-func _screen_to_tilef(pix: Vector2, tile_zoom: int, display_tile_size: Vector2) -> Vector2:
+func _screen_to_tilef(
+			pix: Vector2,
+			tile_zoom: int,
+			display_tile_size: Vector2
+		) -> Vector2:
 	var center_f := _coord_to_tilef(map_center_coord, tile_zoom)
 	var delta_tiles := (pix - (cont_tile_renderer.size / 2.0)) / display_tile_size
 	return center_f + delta_tiles
@@ -509,8 +794,6 @@ func _tilef_to_coord(tile_coord: Vector2, zoom: float) -> Vector2:
 	var longitude := tile_coord.x / n * 360.0 - 180.0
 	var latitude := rad_to_deg(atan(sinh(PI * (1.0 - 2.0 * tile_coord.y / n))))
 	return Vector2(longitude, latitude)
-
-
 #endregion
 
 
@@ -525,13 +808,13 @@ class TileSourceDefinition extends RefCounted:
 
 
 	func _init(
-		_id: StringName,
-		_provider_type: ProviderType,
-		_layer_id: StringName,
-		_language: StringName,
-		_img_format: ImgFormat,
-		_tile_size: Vector2i,
-	) -> void:
+				_id: StringName,
+				_provider_type: ProviderType,
+				_layer_id: StringName,
+				_language: StringName,
+				_img_format: ImgFormat,
+				_tile_size: Vector2i,
+			) -> void:
 		id = _id
 		provider_type = _provider_type
 		layer_id = _layer_id
@@ -552,8 +835,8 @@ class TileDefinition extends RefCounted:
 
 class Provider extends RefCounted:
 	var type: ProviderType = ProviderType.OSM
-	var style: MapStyle = MapStyle.STREET
-	var yandex_layer: YandexLayer = YandexLayer.MAP
+	var layer: MapLayer = MapLayer.ROAD
+	var available_layers: Array[MapLayer] = []
 	var img_format: ImgFormat = ImgFormat.PNG
 	var language_code: String = "en"
 	var api_key: String
@@ -562,18 +845,32 @@ class Provider extends RefCounted:
 	var max_zoom: int = 19
 	var attribution_text: String
 	var source: TileSourceDefinition
-	
-	
+
+
+	static func layers_for_type(provider: ProviderType) -> Array[MapLayer]:
+		match provider:
+			ProviderType.OSM:
+				return [MapLayer.ROAD]
+			ProviderType.BING:
+				return [MapLayer.ROAD, MapLayer.SATELLITE, MapLayer.HYBRID]
+			ProviderType.YANDEX:
+				return [MapLayer.ROAD, MapLayer.FUTURE_MAP, MapLayer.DRIVING, MapLayer.TRANSIT, MapLayer.ADMIN]
+			ProviderType.TERRARIUM:
+				return [MapLayer.TERRAIN]
+			ProviderType.WORLD_IMAGERY:
+				return [MapLayer.SATELLITE]
+		return [MapLayer.ROAD]
+
+
 	func _init(
-		_provider_type: ProviderType,
-		_map_style: MapStyle = MapStyle.STREET,
-		_language_code: String = "en",
-		_api_key: String = "",
-		_yandex_layer: YandexLayer = YandexLayer.MAP,
-	) -> void:
+				_provider_type: ProviderType,
+				_map_layer: MapLayer = MapLayer.ROAD,
+				_language_code: String = "en",
+				_api_key: String = "",
+			) -> void:
 		type = _provider_type
-		style = _map_style
-		yandex_layer = _yandex_layer
+		available_layers = layers_for_type(type)
+		layer = _map_layer if available_layers.has(_map_layer) else available_layers[0]
 		language_code = _language_code
 		api_key = _api_key
 		match type:
@@ -601,8 +898,8 @@ class Provider extends RefCounted:
 		if type == ProviderType.YANDEX and api_key.is_empty():
 			return "Yandex Tiles API requires yandex_api_key. No Yandex tiles will be requested until it is set."
 		return ""
-	
-	
+
+
 	func url_from_index(tile_index: Vector3i) -> String:
 		var zoom: int = tile_index.x
 		var x: int = tile_index.y
@@ -610,19 +907,16 @@ class Provider extends RefCounted:
 		match type:
 			ProviderType.BING:
 				var prefix: String
-				match style:
-					MapStyle.SATELLITE: prefix = "a"
-					MapStyle.STREET: prefix = "r"
-					MapStyle.HYBRID: prefix = "h"
+				match layer:
+					MapLayer.SATELLITE: prefix = "a"
+					MapLayer.HYBRID: prefix = "h"
+					_: prefix = "r"
 				var quadkey := _construct_quadkey(x, y, zoom)
 				var subdomain := posmod(x + y, 4)
 				return "https://ecn.t%d.tiles.virtualearth.net/tiles/%s%s.jpeg?g=1&mkt=%s" % [
-					subdomain,
-					prefix,
-					quadkey,
-					_bing_culture(),
+					subdomain, prefix, quadkey, _bing_culture(),
 				]
-			
+
 			ProviderType.OSM:
 				return "https://tile.openstreetmap.org/%d/%d/%d.png" % [zoom, x, y]
 
@@ -630,12 +924,7 @@ class Provider extends RefCounted:
 				if api_key.is_empty():
 					return ""
 				return "https://tiles.api-maps.yandex.ru/v1/tiles/?apikey=%s&lang=%s&x=%d&y=%d&z=%d&l=map&projection=web_mercator&maptype=%s" % [
-					api_key.uri_encode(),
-					_yandex_language(),
-					x,
-					y,
-					zoom,
-					_yandex_maptype(),
+					api_key.uri_encode(), _yandex_language(), x, y, zoom, _yandex_maptype(),
 				]
 
 			ProviderType.TERRARIUM:
@@ -643,10 +932,10 @@ class Provider extends RefCounted:
 
 			ProviderType.WORLD_IMAGERY:
 				return "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/%d/%d/%d" % [zoom, y, x]
-		
+
 		return ""
-	
-	
+
+
 	func _construct_quadkey(x: int, y: int, zoom: int) -> String:
 		var quadkey := ""
 		for level in range(zoom, 0, -1):
@@ -677,21 +966,20 @@ class Provider extends RefCounted:
 
 
 	func _yandex_maptype() -> String:
-		match yandex_layer:
-			YandexLayer.FUTURE_MAP: return "future_map"
-			YandexLayer.DRIVING: return "driving"
-			YandexLayer.TRANSIT: return "transit"
-			YandexLayer.ADMIN: return "admin"
+		match layer:
+			MapLayer.FUTURE_MAP: return "future_map"
+			MapLayer.DRIVING: return "driving"
+			MapLayer.TRANSIT: return "transit"
+			MapLayer.ADMIN: return "admin"
 			_: return "map"
 
 
 	func _create_source_definition() -> TileSourceDefinition:
-		var layer_id: StringName
+		var layer_id: StringName = StringName(MapLayer.keys()[layer].to_lower())
 		var source_language: StringName
 		var source_id: StringName
 		match type:
 			ProviderType.BING:
-				layer_id = StringName(MapStyle.keys()[style].to_lower())
 				source_language = StringName(_bing_culture())
 				source_id = StringName("bing:%s:%s" % [layer_id, source_language])
 			ProviderType.YANDEX:
@@ -699,23 +987,17 @@ class Provider extends RefCounted:
 				source_language = StringName(_yandex_language())
 				source_id = StringName("yandex:%s:%s" % [layer_id, source_language])
 			ProviderType.TERRARIUM:
-				layer_id = &"elevation"
-				source_id = &"terrarium:elevation"
+				source_id = &"terrarium:terrain"
 			ProviderType.WORLD_IMAGERY:
-				layer_id = &"imagery"
-				source_id = &"world_imagery:imagery"
+				source_id = &"world_imagery:satellite"
 			_:
-				layer_id = &"standard"
-				source_id = &"osm:standard"
+				source_id = &"osm:road"
 
 		return TileSourceDefinition.new(
-			source_id,
-			type,
-			layer_id,
-			source_language,
-			img_format,
-			Vector2i(tile_size),
+			source_id, type, layer_id, source_language,
+			img_format, Vector2i(tile_size),
 		)
+
 
 class TileRequest extends RefCounted:
 	signal completed(
