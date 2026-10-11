@@ -26,4 +26,4 @@ project/assembly_name="DavidMaps"
 
 [editor_plugins]
 
-enabled=PackedStringArray("res://addons/DavidMaps/plugin.cfg")
+enabled=PackedStringArray("res://addons/DavidMaps/plugin.cfg", "res://addons/script-ide/plugin.cfg")
