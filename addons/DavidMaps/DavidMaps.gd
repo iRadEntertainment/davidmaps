@@ -121,7 +121,7 @@ func setup() -> void:
 	map_center_coord = _sanitize_coord(Vector2(start_longitude, start_latitude))
 	_provider = Provider.new(provider_type, map_layer)
 	map_layer = _provider.layer
-	_target_zoom = clampf(start_zoom, _provider.min_zoom, _provider.max_zoom)
+	_target_zoom = _normalize_zoom(clampf(start_zoom, _provider.min_zoom, _provider.max_zoom))
 	
 	# setup_nodes
 	if tile_loader == null:
@@ -181,7 +181,7 @@ func go_to(zoom: float, lat: float, lon: float, tweened: bool = false) -> void:
 		start_longitude = destination.x
 		return
 
-	var target_zoom := clampf(zoom, _provider.min_zoom, _provider.max_zoom)
+	var target_zoom := _normalize_zoom(clampf(zoom, _provider.min_zoom, _provider.max_zoom))
 	_cancel_navigation()
 	if not tweened or not is_inside_tree() or navigation_duration <= 0.0:
 		_apply_view(target_zoom, destination)
@@ -198,12 +198,19 @@ func go_to(zoom: float, lat: float, lon: float, tweened: bool = false) -> void:
 		return
 
 	_navigation_tween = create_tween()
-	_navigation_tween.set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_IN_OUT)
+	_navigation_tween.set_meta(&"target_zoom", target_zoom)
+	_navigation_tween.set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)
 	_navigation_tween.tween_method(
 		_animate_view.bind(start_world, end_world, start_zoom_value, target_zoom),
 		0.0, 1.0, navigation_duration
 	)
 	_navigation_tween.finished.connect(_on_navigation_finished)
+
+
+func go_tov(zoom: float, pos: Vector2, tweened: bool = false) -> void:
+	var lat: float = pos.y
+	var lon: float = pos.x
+	go_to(zoom, lat, lon, tweened)
 
 
 func pan_to(lat: float, lon: float, tweened: bool = false) -> void:
@@ -468,12 +475,12 @@ func _gui_input(event: InputEvent) -> void:
 	if not button_event.pressed or not interaction_enabled or not zoom_enabled:
 		return
 	var zoom_anchor := button_event.position - cont_tile_renderer.position
+	var zoom_input_base := _get_navigation_target_zoom()
+	var zoom_step := 0.2 * button_event.factor
 	if button_event.button_index == MOUSE_BUTTON_WHEEL_UP:
-		_cancel_navigation()
-		_set_zoom_level_at_screen_position(_target_zoom + 0.2, zoom_anchor)
+		_set_zoom_level_at_screen_position(zoom_input_base + zoom_step, zoom_anchor)
 	elif button_event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
-		_cancel_navigation()
-		_set_zoom_level_at_screen_position(_target_zoom - 0.2, zoom_anchor)
+		_set_zoom_level_at_screen_position(zoom_input_base - zoom_step, zoom_anchor)
 
 
 func _end_drag() -> void:
@@ -493,15 +500,21 @@ func _pan_by_screen_delta(screen_delta: Vector2) -> void:
 	_apply_view(_target_zoom, _tilef_to_coord(center_f, tile_zoom))
 
 
-func _set_zoom_level_at_screen_position(new_zoom_level: float, screen_position: Vector2) -> void:
-	var clamped_zoom := clampf(new_zoom_level, _provider.min_zoom, _provider.max_zoom)
+func _set_zoom_level_at_screen_position(
+			new_zoom_level: float,
+			screen_position: Vector2
+		) -> void:
+
+	var clamped_zoom := _normalize_zoom(
+		clampf(new_zoom_level, _provider.min_zoom, _provider.max_zoom)
+	)
 	if is_equal_approx(clamped_zoom, _target_zoom):
 		return
 
 	var old_tile_zoom := _get_tile_zoom_level()
 	var anchor_tile_f := _screen_to_tilef(screen_position, old_tile_zoom, _get_display_tile_size(old_tile_zoom))
 	var anchor_coord := _tilef_to_coord(anchor_tile_f, old_tile_zoom)
-	var new_tile_zoom := clampi(ceili(clamped_zoom), _provider.min_zoom, _provider.max_zoom)
+	var new_tile_zoom := _tile_zoom_from_value(clamped_zoom)
 	var new_display_tile_size := _provider.tile_size * pow(2.0, clamped_zoom - new_tile_zoom)
 	var new_anchor_tile_f := _coord_to_tilef(anchor_coord, new_tile_zoom)
 	var screen_offset_tiles := (screen_position - cont_tile_renderer.size / 2.0) / new_display_tile_size
@@ -509,7 +522,14 @@ func _set_zoom_level_at_screen_position(new_zoom_level: float, screen_position: 
 	var world_tile_count := pow(2.0, new_tile_zoom)
 	new_center_f.x = fposmod(new_center_f.x, world_tile_count)
 	new_center_f.y = clampf(new_center_f.y, 0.0, world_tile_count)
-	_apply_view(clamped_zoom, _tilef_to_coord(new_center_f, new_tile_zoom))
+	var coord: Vector2 = _tilef_to_coord(new_center_f, new_tile_zoom)
+	go_tov(clamped_zoom, coord, true)
+
+
+func _get_navigation_target_zoom() -> float:
+	if _navigation_tween != null and _navigation_tween.has_meta(&"target_zoom"):
+		return float(_navigation_tween.get_meta(&"target_zoom"))
+	return _target_zoom
 
 
 func _cancel_navigation() -> void:
@@ -535,7 +555,7 @@ func _on_navigation_finished() -> void:
 func _apply_view(zoom: float, coord: Vector2) -> void:
 	if _provider == null:
 		return
-	var next_zoom := clampf(zoom, _provider.min_zoom, _provider.max_zoom)
+	var next_zoom := _normalize_zoom(clampf(zoom, _provider.min_zoom, _provider.max_zoom))
 	var next_center := _sanitize_coord(coord)
 	if is_equal_approx(_target_zoom, next_zoom) and map_center_coord.is_equal_approx(next_center):
 		return
@@ -553,7 +573,16 @@ func _sanitize_coord(coord: Vector2) -> Vector2:
 
 
 func _get_tile_zoom_level() -> int:
-	return clampi(ceili(_target_zoom), _provider.min_zoom, _provider.max_zoom)
+	return _tile_zoom_from_value(_target_zoom)
+
+
+func _tile_zoom_from_value(zoom: float) -> int:
+	return clampi(ceili(_normalize_zoom(zoom)), _provider.min_zoom, _provider.max_zoom)
+
+
+func _normalize_zoom(zoom: float) -> float:
+	var nearest_integer := roundf(zoom)
+	return nearest_integer if is_equal_approx(zoom, nearest_integer) else zoom
 
 
 func _get_display_tile_size(tile_zoom: int) -> Vector2:
