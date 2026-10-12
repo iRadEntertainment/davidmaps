@@ -104,9 +104,9 @@ unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 script = ExtResource("1_2jas5")
-provider_type = 10
+provider_type = 8
 visualization_scale = 1.7
-map_layer = 9
+map_layer = 6
 max_cached_tiles = 300
 metadata/_custom_type_script = "uid://dbfed6elyysgg"
 

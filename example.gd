@@ -26,8 +26,8 @@ func _populate_opt() -> void:
 
 
 func _update_settings_nodes() -> void:
-	opt_provider.selected = david_maps.provider_type as int
-	opt_layer.selected = david_maps.map_layer as int
+	opt_provider.select(david_maps.get_provider() as int)
+	opt_layer.select(david_maps.get_layer() as int)
 	sl_view_scale.value = david_maps.visualization_scale
 	lb_view_scale.text = "%.02f" % david_maps.visualization_scale
 	ck_debug.button_pressed = david_maps.debug_view_on
@@ -46,7 +46,7 @@ func _on_david_maps_map_mouse_event(
 			lon: float
 		) -> void:
 	if event is InputEventMouseMotion:
-		mouse_lat_log_pos.text = "Lat: %.6f\nLon: %.6f" % [lat, lon]
+		mouse_lat_log_pos.text = "Lat: %.8f\nLon: %.8f" % [lat, lon]
 	
 	elif event is InputEventMouseButton:
 		if event.is_released(): return
@@ -64,7 +64,7 @@ func _on_david_maps_view_changed(
 			lat: float,
 			lon: float
 		) -> void:
-	map_info.text = "Zoom: %.2f\nLat: %.6f\nLon: %.6f" % [zoom, lat, lon]
+	map_info.text = "Zoom: %.2f\nLat: %.8f\nLon: %.8f" % [zoom, lat, lon]
 
 
 func _on_opt_provider_item_selected(index: int) -> void:

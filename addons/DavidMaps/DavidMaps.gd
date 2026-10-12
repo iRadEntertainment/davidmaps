@@ -6,29 +6,29 @@ class_name DavidMaps
 #region Enums
 # Basemaps only; transparent thematic sources are in MapOverlay below.
 enum ProviderType {
-	OSM = 0,
-	WORLD_IMAGERY = 1,
-	TERRARIUM = 2,
-	OSM_FRANCE = 5,
-	CYCLOSM = 6,
-	OPENMAPS = 7,
-	OPNVKARTE = 8,
-	USGS = 9,
-	OPENTOPOMAP = 10,
+	OSM,
+	WORLD_IMAGERY,
+	TERRARIUM,
+	OSM_FRANCE,
+	CYCLOSM,
+	OPENMAPS,
+	OPNVKARTE,
+	USGS,
+	OPENTOPOMAP,
 }
 
 enum MapLayer {
-	ROAD = 0,
-	SATELLITE = 1,
-	HYBRID = 2,
-	TERRAIN = 3,
-	TRANSIT = 6,
-	HIKING = 8,
-	TOPOGRAPHIC = 9,
-	CYCLING = 10,
-	CYCLING_LITE = 11,
-	HUMANITARIAN = 12,
-	SHADED_RELIEF = 13,
+	ROAD,
+	SATELLITE,
+	HYBRID,
+	TERRAIN,
+	TRANSIT,
+	HIKING,
+	TOPOGRAPHIC,
+	CYCLING,
+	CYCLING_LITE,
+	HUMANITARIAN,
+	SHADED_RELIEF,
 }
 
 enum MapOverlay { SEAMARKS, RAILWAYS }
@@ -87,7 +87,8 @@ var cont_tile_renderer: Control
 var cont_debug_renderer: Control
 var tile_canvas: Control
 
-var map_center_coord: Vector2
+var _center_longitude: float
+var _center_latitude: float
 var _target_zoom: float = 0.0
 var _rendered_tile_zoom: int = -1
 var _last_rendered_tile_zoom: int = -1
@@ -123,7 +124,8 @@ func _ready() -> void:
 
 
 func setup() -> void:
-	map_center_coord = _sanitize_coord(Vector2(start_longitude, start_latitude))
+	_center_longitude = _sanitize_longitude(start_longitude)
+	_center_latitude = _sanitize_latitude(start_latitude)
 	_provider = Provider.new(provider_type, map_layer)
 	map_layer = _provider.layer
 	_target_zoom = _normalize_zoom(clampf(start_zoom, _provider.min_zoom, _provider.max_zoom))
@@ -179,34 +181,50 @@ func _validate_property(property: Dictionary) -> void:
 # other Controls/Containers. The closest horizontal world copy is used.
 
 func go_to(zoom: float, lat: float, lon: float, tweened: bool = false) -> void:
-	var destination := _sanitize_coord(Vector2(lon, lat))
+	var destination_longitude: float = _sanitize_longitude(lon)
+	var destination_latitude: float = _sanitize_latitude(lat)
 	if _provider == null:
 		start_zoom = zoom
-		start_latitude = destination.y
-		start_longitude = destination.x
+		start_latitude = destination_latitude
+		start_longitude = destination_longitude
 		return
 
-	var target_zoom := _normalize_zoom(clampf(zoom, _provider.min_zoom, _provider.max_zoom))
+	var target_zoom: float = _normalize_zoom(
+		clampf(zoom, _provider.min_zoom, _provider.max_zoom)
+	)
 	_cancel_navigation()
 	if not tweened or not is_inside_tree() or navigation_duration <= 0.0:
-		_apply_view(target_zoom, destination)
+		_apply_view(target_zoom, destination_latitude, destination_longitude)
 		return
 
 	# Interpolate normalized Web Mercator coordinates instead of degrees.
 	# Unwrap X across the shortest antimeridian path.
-	var start_world := _coord_to_tilef(map_center_coord, 0.0)
-	var end_world := _coord_to_tilef(destination, 0.0)
-	var shortest_dx := fposmod(end_world.x - start_world.x + 0.5, 1.0) - 0.5
-	end_world.x = start_world.x + shortest_dx
-	var start_zoom_value := _target_zoom
-	if start_world.is_equal_approx(end_world) and is_equal_approx(start_zoom_value, target_zoom):
+	var start_world_x: float = _longitude_to_tile_x(_center_longitude, 0.0)
+	var start_world_y: float = _latitude_to_tile_y(_center_latitude, 0.0)
+	var end_world_x: float = _longitude_to_tile_x(destination_longitude, 0.0)
+	var end_world_y: float = _latitude_to_tile_y(destination_latitude, 0.0)
+	var shortest_dx: float = fposmod(end_world_x - start_world_x + 0.5, 1.0) - 0.5
+	end_world_x = start_world_x + shortest_dx
+	var start_zoom_value: float = _target_zoom
+	if (
+		start_world_x == end_world_x
+		and start_world_y == end_world_y
+		and start_zoom_value == target_zoom
+	):
 		return
 
 	_navigation_tween = create_tween()
 	_navigation_tween.set_meta(&"target_zoom", target_zoom)
 	_navigation_tween.set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)
 	_navigation_tween.tween_method(
-		_animate_view.bind(start_world, end_world, start_zoom_value, target_zoom),
+		_animate_view.bind(
+			start_world_x,
+			start_world_y,
+			end_world_x,
+			end_world_y,
+			start_zoom_value,
+			target_zoom,
+		),
 		0.0, 1.0, navigation_duration
 	)
 	_navigation_tween.finished.connect(_on_navigation_finished)
@@ -223,8 +241,7 @@ func pan_to(lat: float, lon: float, tweened: bool = false) -> void:
 
 
 func zoom_to(zoom: float, tweened: bool = false) -> void:
-	var center := get_center_coord()
-	go_to(zoom, center.y, center.x, tweened)
+	go_to(zoom, _center_latitude, _center_longitude, tweened)
 
 
 # Legacy entry point from the original widget.
@@ -237,30 +254,52 @@ func get_zoom_level() -> float:
 
 
 func get_center_coord() -> Vector2:
-	return map_center_coord if _provider != null else Vector2(start_longitude, start_latitude)
+	if _provider == null:
+		return Vector2(start_longitude, start_latitude)
+	return Vector2(_center_longitude, _center_latitude)
 
 
 func screen_to_coord(local_position: Vector2) -> Vector2:
 	if _provider == null or cont_tile_renderer == null:
 		return get_center_coord()
-	var tile_zoom := _get_tile_zoom_level()
-	var tile_pos := _screen_to_tilef(
-		local_position - cont_tile_renderer.position,
-		tile_zoom, _get_display_tile_size(tile_zoom)
+	var tile_zoom: int = _get_tile_zoom_level()
+	var renderer_position: Vector2 = local_position - cont_tile_renderer.position
+	var display_tile_size: Vector2 = _get_display_tile_size(tile_zoom)
+	var longitude: float = _sanitize_longitude(
+		_tile_x_to_longitude(
+			_screen_to_tile_x(renderer_position.x, tile_zoom, display_tile_size.x),
+			tile_zoom,
+		)
 	)
-	return _sanitize_coord(_tilef_to_coord(tile_pos, tile_zoom))
+	var latitude: float = _sanitize_latitude(
+		_tile_y_to_latitude(
+			_screen_to_tile_y(renderer_position.y, tile_zoom, display_tile_size.y),
+			tile_zoom,
+		)
+	)
+	return Vector2(longitude, latitude)
 
 
 func coord_to_screen(lat: float, lon: float) -> Vector2:
 	if _provider == null or cont_tile_renderer == null:
 		return size / 2.0
-	var tile_zoom := _get_tile_zoom_level()
-	var center_tiles := _coord_to_tilef(map_center_coord, tile_zoom)
-	var point_tiles := _coord_to_tilef(_sanitize_coord(Vector2(lon, lat)), tile_zoom)
-	var n := pow(2.0, tile_zoom)
-	var delta := point_tiles - center_tiles
-	delta.x = fposmod(delta.x + n * 0.5, n) - n * 0.5
-	return cont_tile_renderer.position + cont_tile_renderer.size / 2.0 + delta * _get_display_tile_size(tile_zoom)
+	var tile_zoom: int = _get_tile_zoom_level()
+	var tile_count: float = pow(2.0, tile_zoom)
+	var delta_x: float = (
+		_longitude_to_tile_x(_sanitize_longitude(lon), tile_zoom)
+		- _longitude_to_tile_x(_center_longitude, tile_zoom)
+	)
+	delta_x = fposmod(delta_x + tile_count * 0.5, tile_count) - tile_count * 0.5
+	var delta_y: float = (
+		_latitude_to_tile_y(_sanitize_latitude(lat), tile_zoom)
+		- _latitude_to_tile_y(_center_latitude, tile_zoom)
+	)
+	var display_tile_size: Vector2 = _get_display_tile_size(tile_zoom)
+	return (
+		cont_tile_renderer.position
+		+ cont_tile_renderer.size / 2.0
+		+ Vector2(delta_x * display_tile_size.x, delta_y * display_tile_size.y)
+	)
 
 
 # west_lon > east_lon denotes bounds crossing the antimeridian.
@@ -282,8 +321,8 @@ func fit_bounds(
 	var east := wrapf(east_lon, -180.0, 180.0)
 	# Keep the full-world case distinct from a zero-width meridian.
 	var x_span := 1.0 if absf(east_lon - west_lon) >= 360.0 else fposmod(east - west, 360.0) / 360.0
-	var north_y := _coord_to_tilef(Vector2(0.0, north), 0.0).y
-	var south_y := _coord_to_tilef(Vector2(0.0, south), 0.0).y
+	var north_y: float = _latitude_to_tile_y(north, 0.0)
+	var south_y: float = _latitude_to_tile_y(south, 0.0)
 	var y_span := south_y - north_y
 
 	var target_zoom := float(_provider.max_zoom)
@@ -293,12 +332,17 @@ func fit_bounds(
 	if y_span > 0.0:
 		target_zoom = minf(target_zoom, log(view_size.y / (scaled_tile_size.y * y_span)) / log(2.0))
 
-	var center_world := Vector2(
-		fposmod((west + 180.0) / 360.0 + x_span * 0.5, 1.0),
-		(north_y + south_y) * 0.5
+	var center_world_x: float = fposmod(
+		(west + 180.0) / 360.0 + x_span * 0.5,
+		1.0,
 	)
-	var center := _tilef_to_coord(center_world, 0.0)
-	go_to(target_zoom, center.y, center.x, tweened)
+	var center_world_y: float = (north_y + south_y) * 0.5
+	go_to(
+		target_zoom,
+		_tile_y_to_latitude(center_world_y, 0.0),
+		_tile_x_to_longitude(center_world_x, 0.0),
+		tweened,
+	)
 
 
 func get_provider() -> ProviderType:
@@ -336,7 +380,7 @@ func set_provider(type: ProviderType) -> void:
 	map_layer = _provider.layer
 	var clamped_zoom := clampf(_target_zoom, _provider.min_zoom, _provider.max_zoom)
 	if not is_equal_approx(clamped_zoom, _target_zoom):
-		_apply_view(clamped_zoom, map_center_coord)
+		_apply_view(clamped_zoom, _center_latitude, _center_longitude)
 	else:
 		update()  # The source changed, even if camera coordinates did not.
 	if old_type != type:
@@ -435,10 +479,23 @@ func _gui_input(event: InputEvent) -> void:
 	if not event is InputEventMouse:
 		return
 
-	# Convert using the camera state at the instant the event arrives.
 	var mouse_event: InputEventMouse = event
-	var world_coord := screen_to_coord(mouse_event.position)
-	map_mouse_event.emit(mouse_event, world_coord.y, world_coord.x)
+	var tile_zoom: int = _get_tile_zoom_level()
+	var renderer_position: Vector2 = mouse_event.position - cont_tile_renderer.position
+	var display_tile_size: Vector2 = _get_display_tile_size(tile_zoom)
+	var longitude: float = _sanitize_longitude(
+		_tile_x_to_longitude(
+			_screen_to_tile_x(renderer_position.x, tile_zoom, display_tile_size.x),
+			tile_zoom,
+		)
+	)
+	var latitude: float = _sanitize_latitude(
+		_tile_y_to_latitude(
+			_screen_to_tile_y(renderer_position.y, tile_zoom, display_tile_size.y),
+			tile_zoom,
+		)
+	)
+	map_mouse_event.emit(mouse_event, latitude, longitude)
 
 	if event is InputEventMouseMotion:
 		var event_canvas_position: Vector2 = get_global_transform_with_canvas() * event.position
@@ -496,14 +553,24 @@ func _end_drag() -> void:
 
 
 func _pan_by_screen_delta(screen_delta: Vector2) -> void:
-	var tile_zoom := _get_tile_zoom_level()
-	var display_tile_size := _get_display_tile_size(tile_zoom)
-	var center_f := _coord_to_tilef(map_center_coord, tile_zoom)
-	center_f -= screen_delta / display_tile_size
-	var world_tile_count := pow(2.0, tile_zoom)
-	center_f.x = fposmod(center_f.x, world_tile_count)
-	center_f.y = clampf(center_f.y, 0.0, world_tile_count)
-	_apply_view(_target_zoom, _tilef_to_coord(center_f, tile_zoom))
+	var tile_zoom: int = _get_tile_zoom_level()
+	var display_tile_size: Vector2 = _get_display_tile_size(tile_zoom)
+	var world_tile_count: float = pow(2.0, tile_zoom)
+	var center_tile_x: float = (
+		_longitude_to_tile_x(_center_longitude, tile_zoom)
+		- screen_delta.x / display_tile_size.x
+	)
+	var center_tile_y: float = (
+		_latitude_to_tile_y(_center_latitude, tile_zoom)
+		- screen_delta.y / display_tile_size.y
+	)
+	center_tile_x = fposmod(center_tile_x, world_tile_count)
+	center_tile_y = clampf(center_tile_y, 0.0, world_tile_count)
+	_apply_view(
+		_target_zoom,
+		_tile_y_to_latitude(center_tile_y, tile_zoom),
+		_tile_x_to_longitude(center_tile_x, tile_zoom),
+	)
 
 
 func _set_zoom_level_at_screen_position(
@@ -517,19 +584,39 @@ func _set_zoom_level_at_screen_position(
 	if is_equal_approx(clamped_zoom, _target_zoom):
 		return
 
-	var old_tile_zoom := _get_tile_zoom_level()
-	var anchor_tile_f := _screen_to_tilef(screen_position, old_tile_zoom, _get_display_tile_size(old_tile_zoom))
-	var anchor_coord := _tilef_to_coord(anchor_tile_f, old_tile_zoom)
-	var new_tile_zoom := _tile_zoom_from_value(clamped_zoom)
-	var new_display_tile_size := _get_display_tile_size_at_zoom(new_tile_zoom, clamped_zoom)
-	var new_anchor_tile_f := _coord_to_tilef(anchor_coord, new_tile_zoom)
-	var screen_offset_tiles := (screen_position - cont_tile_renderer.size / 2.0) / new_display_tile_size
-	var new_center_f := new_anchor_tile_f - screen_offset_tiles
-	var world_tile_count := pow(2.0, new_tile_zoom)
-	new_center_f.x = fposmod(new_center_f.x, world_tile_count)
-	new_center_f.y = clampf(new_center_f.y, 0.0, world_tile_count)
-	var coord: Vector2 = _tilef_to_coord(new_center_f, new_tile_zoom)
-	go_tov(clamped_zoom, coord, true)
+	var old_tile_zoom: int = _get_tile_zoom_level()
+	var old_display_tile_size: Vector2 = _get_display_tile_size(old_tile_zoom)
+	var anchor_longitude: float = _tile_x_to_longitude(
+		_screen_to_tile_x(screen_position.x, old_tile_zoom, old_display_tile_size.x),
+		old_tile_zoom,
+	)
+	var anchor_latitude: float = _tile_y_to_latitude(
+		_screen_to_tile_y(screen_position.y, old_tile_zoom, old_display_tile_size.y),
+		old_tile_zoom,
+	)
+	var new_tile_zoom: int = _tile_zoom_from_value(clamped_zoom)
+	var new_display_tile_size: Vector2 = _get_display_tile_size_at_zoom(
+		new_tile_zoom,
+		clamped_zoom,
+	)
+	var screen_offset: Vector2 = screen_position - cont_tile_renderer.size / 2.0
+	var new_center_tile_x: float = (
+		_longitude_to_tile_x(anchor_longitude, new_tile_zoom)
+		- screen_offset.x / new_display_tile_size.x
+	)
+	var new_center_tile_y: float = (
+		_latitude_to_tile_y(anchor_latitude, new_tile_zoom)
+		- screen_offset.y / new_display_tile_size.y
+	)
+	var world_tile_count: float = pow(2.0, new_tile_zoom)
+	new_center_tile_x = fposmod(new_center_tile_x, world_tile_count)
+	new_center_tile_y = clampf(new_center_tile_y, 0.0, world_tile_count)
+	go_to(
+		clamped_zoom,
+		_tile_y_to_latitude(new_center_tile_y, new_tile_zoom),
+		_tile_x_to_longitude(new_center_tile_x, new_tile_zoom),
+		true,
+	)
 
 
 func _get_navigation_target_zoom() -> float:
@@ -545,12 +632,20 @@ func _cancel_navigation() -> void:
 
 
 func _animate_view(
-	progress: float, start_world: Vector2, end_world: Vector2,
+	progress: float,
+	start_world_x: float,
+	start_world_y: float,
+	end_world_x: float,
+	end_world_y: float,
 	from_zoom: float, to_zoom: float,
 ) -> void:
-	var world := start_world.lerp(end_world, progress)
-	var center := _tilef_to_coord(world, 0.0)
-	_apply_view(lerpf(from_zoom, to_zoom, progress), center)
+	var world_x: float = lerpf(start_world_x, end_world_x, progress)
+	var world_y: float = lerpf(start_world_y, end_world_y, progress)
+	_apply_view(
+		lerpf(from_zoom, to_zoom, progress),
+		_tile_y_to_latitude(world_y, 0.0),
+		_tile_x_to_longitude(world_x, 0.0),
+	)
 
 
 func _on_navigation_finished() -> void:
@@ -558,24 +653,33 @@ func _on_navigation_finished() -> void:
 	navigation_finished.emit()
 
 
-func _apply_view(zoom: float, coord: Vector2) -> void:
+func _apply_view(zoom: float, latitude: float, longitude: float) -> void:
 	if _provider == null:
 		return
-	var next_zoom := _normalize_zoom(clampf(zoom, _provider.min_zoom, _provider.max_zoom))
-	var next_center := _sanitize_coord(coord)
-	if is_equal_approx(_target_zoom, next_zoom) and map_center_coord.is_equal_approx(next_center):
+	var next_zoom: float = _normalize_zoom(
+		clampf(zoom, _provider.min_zoom, _provider.max_zoom)
+	)
+	var next_longitude: float = _sanitize_longitude(longitude)
+	var next_latitude: float = _sanitize_latitude(latitude)
+	if (
+		_target_zoom == next_zoom
+		and _center_longitude == next_longitude
+		and _center_latitude == next_latitude
+	):
 		return
 	_target_zoom = next_zoom
-	map_center_coord = next_center
+	_center_longitude = next_longitude
+	_center_latitude = next_latitude
 	update()
-	view_changed.emit(_target_zoom, map_center_coord.y, map_center_coord.x)
+	view_changed.emit(_target_zoom, _center_latitude, _center_longitude)
 
 
-func _sanitize_coord(coord: Vector2) -> Vector2:
-	return Vector2(
-		wrapf(coord.x, -180.0, 180.0),
-		clampf(coord.y, -MAX_MERCATOR_LATITUDE, MAX_MERCATOR_LATITUDE)
-	)
+func _sanitize_longitude(longitude: float) -> float:
+	return wrapf(longitude, -180.0, 180.0)
+
+
+func _sanitize_latitude(latitude: float) -> float:
+	return clampf(latitude, -MAX_MERCATOR_LATITUDE, MAX_MERCATOR_LATITUDE)
 
 
 func _get_tile_zoom_level() -> int:
@@ -648,11 +752,17 @@ func _draw_tile_layer(
 			renderer_size: Vector2,
 			tiles: Dictionary
 		) -> void:
-	var display_tile_size := _get_display_tile_size(tile_zoom)
-	var center_f: Vector2 = _coord_to_tilef(map_center_coord, tile_zoom)
+	var display_tile_size: Vector2 = _get_display_tile_size(tile_zoom)
+	var center_tile_x: float = _longitude_to_tile_x(_center_longitude, tile_zoom)
+	var center_tile_y: float = _latitude_to_tile_y(_center_latitude, tile_zoom)
 	var n: int = 1 << tile_zoom
-	var center_screen := renderer_size / 2.0
-	var tile_rect := _get_tile_grid_rect(center_f, renderer_size, display_tile_size)
+	var center_screen: Vector2 = renderer_size / 2.0
+	var tile_rect: Rect2i = _get_tile_grid_rect(
+		center_tile_x,
+		center_tile_y,
+		renderer_size,
+		display_tile_size,
+	)
 
 	for y_un in range(tile_rect.position.y, tile_rect.end.y):
 		if y_un < 0 or y_un >= n:
@@ -670,33 +780,42 @@ func _draw_tile_layer(
 			if tex == null:
 				continue
 
-			var base_pos := center_screen + Vector2(
-				(x_un - center_f.x) * display_tile_size.x,
-				(y_un - center_f.y) * display_tile_size.y
+			var base_pos: Vector2 = center_screen + Vector2(
+				(float(x_un) - center_tile_x) * display_tile_size.x,
+				(float(y_un) - center_tile_y) * display_tile_size.y,
 			)
 
 			_draw_tex_if_visible(tex, base_pos, display_tile_size, renderer_size)
 
 
 func _draw_renderer_debug(mouse_pos: Vector2) -> void:
-	var tile_zoom := _get_tile_zoom_level()
-	var display_tile_size := _get_display_tile_size(tile_zoom)
-	# Mouse -> float tile coords at the requested integer zoom.
-	var tf := _screen_to_tilef(mouse_pos, tile_zoom, display_tile_size)
-	var tile_x_unwrapped := int(floor(tf.x))
-	var tile_y_unwrapped := int(floor(tf.y))
+	var tile_zoom: int = _get_tile_zoom_level()
+	var display_tile_size: Vector2 = _get_display_tile_size(tile_zoom)
+	var mouse_tile_x: float = _screen_to_tile_x(
+		mouse_pos.x,
+		tile_zoom,
+		display_tile_size.x,
+	)
+	var mouse_tile_y: float = _screen_to_tile_y(
+		mouse_pos.y,
+		tile_zoom,
+		display_tile_size.y,
+	)
+	var tile_x_unwrapped: int = floori(mouse_tile_x)
+	var tile_y_unwrapped: int = floori(mouse_tile_y)
 
 	# Indices for fetching/label (wrap X, clamp Y)
 	var n: int = 1 << tile_zoom
 	var tile_x: int = ((tile_x_unwrapped % n) + n) % n
 	var tile_y: int = clampi(tile_y_unwrapped, 0, n - 1)
 
-	# Where to draw the outline (use UNWRAPPED indices so the box is exactly under the mouse)
-	var center_f: Vector2 = _coord_to_tilef(map_center_coord, tile_zoom)
+	# Use unwrapped indices so the box is exactly under the mouse.
+	var center_tile_x: float = _longitude_to_tile_x(_center_longitude, tile_zoom)
+	var center_tile_y: float = _latitude_to_tile_y(_center_latitude, tile_zoom)
 	var top_left: Vector2 = (cont_tile_renderer.size / 2.0) + Vector2(
-		(tile_x_unwrapped - center_f.x),
-		(tile_y_unwrapped - center_f.y)
-	) * display_tile_size
+		(float(tile_x_unwrapped) - center_tile_x) * display_tile_size.x,
+		(float(tile_y_unwrapped) - center_tile_y) * display_tile_size.y,
+	)
 	var r := Rect2(top_left, display_tile_size)
 
 	# Draw: outline + center label
@@ -794,12 +913,18 @@ func _request_visible_tiles() -> void:
 	_overlay_tile_zooms.clear()
 	var candidates: Array[TileLoadCandidate] = []
 
-	var tile_zoom := _get_tile_zoom_level()
+	var tile_zoom: int = _get_tile_zoom_level()
 	_track_rendered_tile_zoom(tile_zoom)
-	var display_tile_size := _get_display_tile_size(tile_zoom)
-	var center_f := _coord_to_tilef(map_center_coord, tile_zoom)
-	var n := 1 << tile_zoom
-	var tile_rect := _get_tile_grid_rect(center_f, cont_tile_renderer.size, display_tile_size)
+	var display_tile_size: Vector2 = _get_display_tile_size(tile_zoom)
+	var center_tile_x: float = _longitude_to_tile_x(_center_longitude, tile_zoom)
+	var center_tile_y: float = _latitude_to_tile_y(_center_latitude, tile_zoom)
+	var n: int = 1 << tile_zoom
+	var tile_rect: Rect2i = _get_tile_grid_rect(
+		center_tile_x,
+		center_tile_y,
+		cont_tile_renderer.size,
+		display_tile_size,
+	)
 
 	for y_un in range(tile_rect.position.y, tile_rect.end.y):
 		if y_un < 0 or y_un >= n:
@@ -821,14 +946,16 @@ func _request_visible_tiles() -> void:
 		var overlay_source: OverlaySource = _overlay_sources[overlay]
 		if tile_zoom < overlay_source.min_zoom:
 			continue
-		var overlay_zoom := mini(tile_zoom, overlay_source.max_zoom)
+		var overlay_zoom: int = mini(tile_zoom, overlay_source.max_zoom)
 		_overlay_tile_zooms[overlay] = overlay_zoom
 		var overlay_tiles: Dictionary = {}
 		_visible_overlay_tiles[overlay] = overlay_tiles
-		var overlay_n := 1 << overlay_zoom
-		var overlay_rect := _get_tile_grid_rect(
-			_coord_to_tilef(map_center_coord, overlay_zoom),
-			cont_tile_renderer.size, _get_display_tile_size(overlay_zoom)
+		var overlay_n: int = 1 << overlay_zoom
+		var overlay_rect: Rect2i = _get_tile_grid_rect(
+			_longitude_to_tile_x(_center_longitude, overlay_zoom),
+			_latitude_to_tile_y(_center_latitude, overlay_zoom),
+			cont_tile_renderer.size,
+			_get_display_tile_size(overlay_zoom),
 		)
 		for y_un in range(overlay_rect.position.y, overlay_rect.end.y):
 			if y_un < 0 or y_un >= overlay_n:
@@ -875,21 +1002,26 @@ func _queue_tile_candidates(candidates: Array[TileLoadCandidate]) -> void:
 # Returns (distance ring, exact squared screen-space distance). The world copy
 # nearest to the focus is used so prioritization remains correct at the dateline.
 func _get_tile_distance_priority(tile_index: Vector3i) -> Vector2:
-	var tile_zoom := tile_index.x
-	var display_tile_size := _get_display_tile_size(tile_zoom)
-	var renderer_size := cont_tile_renderer.size
-	var focus := (
+	var tile_zoom: int = tile_index.x
+	var display_tile_size: Vector2 = _get_display_tile_size(tile_zoom)
+	var renderer_size: Vector2 = cont_tile_renderer.size
+	var focus: Vector2 = (
 		_request_focus_position if _request_focus_inside else renderer_size / 2.0
 	)
-	var focus_tile := _screen_to_tilef(focus, tile_zoom, display_tile_size)
-	var center_tile := _coord_to_tilef(map_center_coord, tile_zoom)
-	var world_tile_count := 1 << tile_zoom
-	var unwrapped_x := float(tile_index.y) + roundf(
-		(focus_tile.x - float(tile_index.y)) / float(world_tile_count)
+	var focus_tile_x: float = _screen_to_tile_x(
+		focus.x,
+		tile_zoom,
+		display_tile_size.x,
+	)
+	var center_tile_x: float = _longitude_to_tile_x(_center_longitude, tile_zoom)
+	var center_tile_y: float = _latitude_to_tile_y(_center_latitude, tile_zoom)
+	var world_tile_count: int = 1 << tile_zoom
+	var unwrapped_x: float = float(tile_index.y) + roundf(
+		(focus_tile_x - float(tile_index.y)) / float(world_tile_count)
 	) * float(world_tile_count)
-	var top_left := renderer_size / 2.0 + Vector2(
-		(unwrapped_x - center_tile.x) * display_tile_size.x,
-		(float(tile_index.z) - center_tile.y) * display_tile_size.y,
+	var top_left: Vector2 = renderer_size / 2.0 + Vector2(
+		(unwrapped_x - center_tile_x) * display_tile_size.x,
+		(float(tile_index.z) - center_tile_y) * display_tile_size.y,
 	)
 	var tile_rect := Rect2(top_left, display_tile_size)
 	var nearest_point := Vector2(
@@ -1001,49 +1133,55 @@ func _track_rendered_tile_zoom(tile_zoom: int) -> void:
 
 
 func _get_tile_grid_rect(
-	center_f: Vector2,
+	center_tile_x: float,
+	center_tile_y: float,
 	renderer_size: Vector2,
 	display_tile_size: Vector2,
 	prefetch_padding: int = 1,
 ) -> Rect2i:
-	var half_span := renderer_size / display_tile_size / 2.0
+	var half_span: Vector2 = renderer_size / display_tile_size / 2.0
 	var first := Vector2i(
-		floori(center_f.x - half_span.x) - prefetch_padding,
-		floori(center_f.y - half_span.y) - prefetch_padding,
+		floori(center_tile_x - half_span.x) - prefetch_padding,
+		floori(center_tile_y - half_span.y) - prefetch_padding,
 	)
 	var end := Vector2i(
-		ceili(center_f.x + half_span.x) + prefetch_padding,
-		ceili(center_f.y + half_span.y) + prefetch_padding,
+		ceili(center_tile_x + half_span.x) + prefetch_padding,
+		ceili(center_tile_y + half_span.y) + prefetch_padding,
 	)
 	return Rect2i(first, end - first)
 #endregion
 
 
 #region Canvas/Tile Coord
-# Convert a pixel in renderer local coords to float tile coords.
-func _screen_to_tilef(
-			pix: Vector2,
-			tile_zoom: int,
-			display_tile_size: Vector2
-		) -> Vector2:
-	var center_f := _coord_to_tilef(map_center_coord, tile_zoom)
-	var delta_tiles := (pix - (cont_tile_renderer.size / 2.0)) / display_tile_size
-	return center_f + delta_tiles
+func _screen_to_tile_x(pixel_x: float, tile_zoom: int, tile_width: float) -> float:
+	var center_tile_x: float = _longitude_to_tile_x(_center_longitude, tile_zoom)
+	return center_tile_x + (pixel_x - cont_tile_renderer.size.x / 2.0) / tile_width
 
 
-func _coord_to_tilef(coord: Vector2, zoom: float) -> Vector2:
-	var lat_rad = deg_to_rad(coord.y)
-	var n = pow(2.0, zoom)
-	var x = (coord.x + 180.0) / 360.0 * n
-	var y = (1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / PI) / 2.0 * n
-	return Vector2(x, y)
+func _screen_to_tile_y(pixel_y: float, tile_zoom: int, tile_height: float) -> float:
+	var center_tile_y: float = _latitude_to_tile_y(_center_latitude, tile_zoom)
+	return center_tile_y + (pixel_y - cont_tile_renderer.size.y / 2.0) / tile_height
 
 
-func _tilef_to_coord(tile_coord: Vector2, zoom: float) -> Vector2:
-	var n := pow(2.0, zoom)
-	var longitude := tile_coord.x / n * 360.0 - 180.0
-	var latitude := rad_to_deg(atan(sinh(PI * (1.0 - 2.0 * tile_coord.y / n))))
-	return Vector2(longitude, latitude)
+func _longitude_to_tile_x(longitude: float, zoom: float) -> float:
+	return (longitude + 180.0) / 360.0 * pow(2.0, zoom)
+
+
+func _latitude_to_tile_y(latitude: float, zoom: float) -> float:
+	var latitude_radians: float = deg_to_rad(latitude)
+	return (
+		1.0
+		- log(tan(latitude_radians) + 1.0 / cos(latitude_radians)) / PI
+	) / 2.0 * pow(2.0, zoom)
+
+
+func _tile_x_to_longitude(tile_x: float, zoom: float) -> float:
+	return tile_x / pow(2.0, zoom) * 360.0 - 180.0
+
+
+func _tile_y_to_latitude(tile_y: float, zoom: float) -> float:
+	var tile_count: float = pow(2.0, zoom)
+	return rad_to_deg(atan(sinh(PI * (1.0 - 2.0 * tile_y / tile_count))))
 #endregion
 
 
